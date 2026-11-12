@@ -1,0 +1,6 @@
+# dsh-context-fold bundle layer: the plugin needs no configuration to start, so this patch only
+# inserts the row. Per-session tuning lives in the profile's own cordis.patch.yml, under this entry's
+# `config` (see README §Configuration).
+- insert:
+    - id: context-fold
+      name: dsh-context-fold

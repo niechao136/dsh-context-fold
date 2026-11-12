@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Context Fold (dsh-context-fold)",
+    "description": "Stage-boundary folding of completed tool results: conclusions stay in the window, full text moves to a spill file, and /context-fold reports savings and re-reads."
+  }
+}
