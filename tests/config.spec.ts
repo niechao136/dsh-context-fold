@@ -19,6 +19,11 @@ describe('resolveConfig', () => {
     expect(config.enabled).toBe(true)
   })
 
+  it('defaults plain-turn reasoning folding off, because it is route-dependent', () => {
+    expect(resolveConfig({}).foldPlainTurnReasoning).toBe(false)
+    expect(resolveConfig({ foldPlainTurnReasoning: true }).foldPlainTurnReasoning).toBe(true)
+  })
+
   it('accepts partial overrides and keeps the rest', () => {
     const config = resolveConfig({ minFoldChars: 500 })
     expect(config.minFoldChars).toBe(500)

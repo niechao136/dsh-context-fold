@@ -447,21 +447,33 @@ The first draft assumed reasoning folding required rewriting `SessionEventMap` r
 1. **`assistant/message` cannot be surface-replaced at all.** In `0.2.2`, `assertSourceEventReferences` throws *"assistant/message embeds its source stream and cannot carry sourceEventSeqs"*, while a replacement must cite every shadowed node. So the phase-1 replace protocol is structurally unavailable for assistant messages — no amount of replay handling would make it work.
 2. **Replay signatures were not actually present.** Probing three real session logs (13,701 / 7,077 / 5,084 events) found `source.replayState === undefined` on *every* assistant message, across `deepseek-flash` and `codebuddy`. The provider branch of `toPiAssistant` is not on this path, so there was never a signature to preserve.
 
-### 12.2 The seam: a registered message projection
+### 12.2 The seam: a registered message projection, carried by a plugin *record*
 
-`ctx.sessions.registerMessageProjection(def)` is the host's supported way for a plugin to change what a request sees **without changing the log**. `dsh-compaction-image-offload` ships exactly this pattern for `image/offload`, including the `declare module '@deepseek-ai/dsh-session/types'` augmentation that adds the plugin's event to `SessionEventMap`.
+`ctx.sessions.registerMessageProjection(def)` is the host's supported way for a plugin to change what a request sees **without changing the log**. Verified chain: `dsh-agent-loop` builds requests with `this.session.deriveMessages()`; `deriveMessages()` walks `surface.nodes` and calls `deriveEventMessage`; that applies any registered projection and bumps `contentGeneration` so the cache is invalidated.
+
+**A correction that matters more than the mechanism:** the durable decision is carried by `appendPluginRecord`, *not* `session.append`.
+
+`dsh-compaction-image-offload` is *not* a precedent for inventing an event type. `image/offload` is a **harness-core** member of `KNOWN_SESSION_EVENT_TYPES`; a downstream plugin cannot join that set by declaring a `SessionEventMap` augmentation, which is TypeScript-only.
+
+A plain `session.append()` of a plugin-invented type produces an envelope of exactly `{type, seq, time, data}` with no `ignorable` marker, and `dsh-session-persistence`'s `assertEventsSupported` refuses such a log on reopen:
+
+> "contains event type … unknown to this harness and not marked ignorable; refusing to interpret the log"
+
+That would make any session containing a single reasoning fold **unreopenable** — the user's whole conversation lost, triggered by normal use. The first implementation of this phase had exactly that defect. `appendPluginRecord` is the sanctioned carrier: it stamps `ignorable: true`, so an older reader retains and skips the record, and `reasoningProjection` still drives `deriveMessages()` from it (verified end-to-end).
+
+The "in-memory restore proves it" test was not sufficient, because `Session.create(seed)` does not run the persistence vocabulary gate. `tests/reasoning-persistence.spec.ts` now pins the real gate predicate explicitly.
 
 Verified consequences:
 
-- `Session.deriveMessages()` is the source of request messages — `dsh-agent-loop` calls `this.buildRequest(..., this.session.deriveMessages(), ...)`.
-- Projections are applied in `deriveEventMessage`, cached per `contentGeneration`, and survive `Session.create` restore and fork when the definition is supplied.
-- The message count, identity, block count, and block types are all preserved, so this is compatible with the replay validation even on a signed route.
-
-**Design consequence:** the fold is a *pure function of the log plus the registered definition*, so replay is exact by construction. The full original reasoning stays in the append-only event.
+- The message count, identity, block count, and block types are all preserved, so this is compatible with replay validation even on a signed route.
+- **Design consequence:** the fold is a *pure function of the log plus the registered definition*, so replay is exact by construction. The full original reasoning stays in the append-only event.
+- A projection must **not** be registered for a surface event type: `planSurfaceEvent` returns a `project` plan instead of an append/replace plan, so registering one would silently drop every message of that type off the surface.
 
 ### 12.3 What reasoning actually costs — measured
 
-The DeepSeek adapter only re-sends reasoning on tool-call turns (`serializeAssistant`: `reasoning_content` is emitted only when `toolCalls.length > 0`, because it "is ignored on plain turns, so we drop it there"). Other routes do replay plain-turn reasoning — pi-ai's `foreignAssistant` maps *every* reasoning block to `{type:'thinking'}` — but the measured plain-turn share is negligible. Measuring three real sessions:
+The DeepSeek adapter only re-sends reasoning on tool-call turns (`serializeAssistant`: `reasoning_content` is emitted only when `toolCalls.length > 0`, because it "is ignored on plain turns, so we drop it there"). **But that is not the route this profile runs.** The active route is `router`, whose `dsh-router-core` serializer `wireMessages` emits `...reasoning.length > 0 ? { reasoning_content } : {}` **unconditionally** — so on the real route plain-turn reasoning IS re-sent and does cost tokens.
+
+Measuring three real sessions:
 
 | Session | Reasoning on tool-call turns | Reasoning on plain turns (already free) |
 |---|---|---|
@@ -469,13 +481,16 @@ The DeepSeek adapter only re-sends reasoning on tool-call turns (`serializeAssis
 | super-agent A | 185 msgs, **195,145 chars** | 1 msg, 5,955 chars |
 | super-agent B | 345 msgs, **178,742 chars** | 6 msgs, 398 chars |
 
-So the addressable target is the tool-call-turn reasoning — ~12–19% of the surface. Plain-turn reasoning would be at most 0.03–2.7%, and on the DeepSeek route it is free already. Restricting to tool-call turns therefore captures essentially all of the win while staying correct on any route: on a route that *does* replay plain-turn reasoning we leave that small share on the table rather than risk folding a message whose reasoning is cheap to keep.
+So the dominant target is tool-call-turn reasoning — ~12–19% of the surface. Plain-turn reasoning is a smaller share, but on the router route it is real money. Because the serializer differs per route, the policy is **route-aware by configuration**:
+
+- `foldReasoning` (default **true**) folds tool-call turns. Safe and valuable on every route.
+- `foldPlainTurnReasoning` (default **false**) additionally folds plain turns. Enable it on a router route, where plain-turn reasoning is re-sent; leave it off on `dsh-llm-deepseek`, where it is dropped and folding would save nothing.
 
 ### 12.4 Rules
 
 Deterministic, no model call, matching phase 1's contract:
 
-- **Only tool-call turns fold.** Plain-turn reasoning is free on the DeepSeek route and negligible elsewhere (0.03–2.7%), so including it would add risk for no measurable return.
+- **Tool-call turns fold by default; plain turns only on request.** Which turns cost tokens depends on the route's serializer (see 12.3), so the plain-turn share is a configuration decision rather than a hard-coded assumption.
 - **Head preserved verbatim.** 240 code points of the thought's opening stay inline, followed by an explicit `[… N chars of earlier reasoning omitted]` note. The head is a literal prefix of the original, so nothing is invented.
 - **`MIN_REASONING_CHARS = 1200`.** Below this the marker plus the note cost as much as the text.
 - **Age and recency reuse phase 1's rules** (`turn < currentTurn || age >= staleSteps`, and never within `keepRecentSteps`), so a single long turn has an exit and in-use content never moves.
@@ -495,10 +510,17 @@ The projection is registered **even when `foldReasoning: false`**, because the f
 
 The host permits exactly one definition per event type, and `apply()` can run twice (a reload, or two config rows naming the same package). A duplicate registration is caught and warned about rather than thrown out of `apply()`: the first registration is already live and correct.
 
-### 12.7 Still open for phase 2
+### 12.7 Open gap: folded reasoning has no retrieval path
 
-- **The spill path.** Phase 1 writes the full original to the spill store and inlines a path; phase 2 does not, because the assistant event *is* the original and is never rewritten. If the dumped reasoning needs to be re-readable through `read`/`grep` (not just replayable), a spill write must be added — currently the full text is recoverable only from the session log. This is a gap, not a bug: no conclusion is lost, but the chain-of-recall hop does not exist for reasoning yet.
-- **Interaction with `compaction-basic`.** A compaction span that covers an assistant node changes its surface seq, so a reasoning target pointing at the old seq goes stale and is skipped. Intended, but untested against a real `/compact`.
+Phase 2 writes no spill file. That is worse than it first looks, and the earlier wording here ("a gap, not a bug: no conclusion is lost") understated it.
+
+The head is kept, so a conclusion survives — but the message trail says `[… N chars of earlier reasoning omitted]` and offers **no recovery path**. That is a pointer to nothing. Phase 1's promise is "conclusions inline, details one hop away": the model can call `read`/`grep` on the locator. Phase 2 delivers "conclusions inline, details unreachable" — the only copy is the raw `assistant/message` event, which no tool exposes.
+
+Why this is worse than phase 1's tradeoff: it *invites* the model to believe the detail is recoverable. A model that was reasoning its way through a subtle problem cannot go back and re-read how far it got, and cannot know it cannot.
+
+The fix is to spill the original reasoning text at fold time and inline the locator in the same marker, exactly as phase 1 does, so both kinds of fold share one recall chain. That is the next piece of work; it is recorded here rather than quietly dropped.
+
+**Also still open:** the interaction with `compaction-basic`. A compaction span covering an assistant node changes its surface seq, so a reasoning target pointing at the old seq goes stale and is skipped. Intended (see 12.6), but untested against a real `/compact`.
 
 ---
 

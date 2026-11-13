@@ -32,7 +32,7 @@
  * @module dsh-context-fold/reasoning
  */
 import type { AssistantMessage, ContentBlock, Message } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
+import { appendPluginRecord, pluginRecordOf, type Session, type SessionEvent, type SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionMessageProjection, SessionMessageProjectionContext } from '@deepseek-ai/dsh-session/surface'
 import type { ContextFoldConfig } from './config.ts'
 import { FOLD_MARKER } from './format.ts'
@@ -41,40 +41,61 @@ import { codePointLength } from './rules.ts'
 /** Marker opening a folded reasoning block. Must be distinctive: `startsWith` is the idempotency test. */
 export const REASONING_MARKER = `${FOLD_MARKER} [reasoning]`
 
-/** Durable event type carrying one reasoning-fold decision. */
-export const REASONING_EVENT = 'context-fold/reasoning'
+/** Durable record type carrying one reasoning-fold decision. */
+export const REASONING_EVENT = 'plugin:context-fold/reasoning'
 
-/** One reasoning fold recorded by a decision event. */
+/** One reasoning fold recorded by a decision record. */
 export interface ReasoningTarget {
   /** Surface seq of the assistant node whose reasoning is folded. */
   seq: SessionSeq
-  /** Original code-point length of each folded reasoning block, in content order. */
+  /** Content indexes of the folded reasoning blocks, in content order. */
+  indexes: readonly number[]
+  /** Original code-point length of each folded block, for the report. */
   chars: readonly number[]
 }
 
-/** Data of one `context-fold/reasoning` decision event. */
+/** Data of one `plugin:context-fold/reasoning` decision record. */
 export interface ReasoningFoldData {
   /** Targets, in surface order. */
   targets: readonly ReasoningTarget[]
 }
 
 /**
- * Declare the durable decision event, exactly as `dsh-compaction-image-offload`
- * declares `image/offload`: a plugin-owned event that a registered message
- * projection interprets. The `@messageProjection` tag marks it as one.
+ * Declare the durable decision record.
+ *
+ * This uses {@link PluginRecordMap}, **not** `SessionEventMap`. That distinction
+ * is load-bearing and was initially got wrong here:
+ *
+ * A `SessionEventMap` augmentation only adds a *TypeScript* type. The record
+ * written by `session.append()` carries an envelope of exactly
+ * `{type, seq, time, data}` with **no `ignorable` marker**, and the persistence
+ * read path refuses any type outside `KNOWN_SESSION_EVENT_TYPES` unless
+ * `ignorable === true`:
+ *
+ * > "contains event type … unknown to this harness and not marked ignorable;
+ * > refusing to interpret the log"
+ * > — `dsh-session-persistence` `assertEventsSupported`
+ *
+ * So a plain `append` of a plugin-invented type makes the session **unreopenable**,
+ * which would lose the whole conversation. `appendPluginRecord` is the host's
+ * sanctioned alternative: it stamps `ignorable: true`, and a reader that does not
+ * know the type retains and skips it.
+ *
+ * `dsh-compaction-image-offload` is *not* a precedent for the other approach,
+ * because `image/offload` is a harness-core member of
+ * `KNOWN_SESSION_EVENT_TYPES`; a downstream plugin cannot join that set.
  */
 declare module '@deepseek-ai/dsh-session/types' {
-  interface SessionEventMap {
+  interface PluginRecordMap {
     /**
      * Fold historical reasoning blocks on tool-call turns.
      *
-     * Targets name current `assistant/message` surface nodes and how many of
-     * their reasoning blocks the decision covers, in content order. Message
-     * identity, block count, and block types are preserved; the durable event
+     * Targets name current `assistant/message` surface nodes and the content
+     * indexes of the reasoning blocks the decision covers. Message identity,
+     * block count, and block types are preserved; the durable assistant event
      * keeps the full original text.
-     * @messageProjection
      */
-    'context-fold/reasoning': ReasoningFoldData
+    'plugin:context-fold/reasoning': ReasoningFoldData
   }
 }
 
@@ -104,12 +125,22 @@ export function isFoldedReasoning(text: string): boolean {
 }
 
 /**
- * Whether a message is a tool-call turn.
+ * Whether a message is a tool-call turn, i.e. a turn that requested tool work.
  *
- * That is where reasoning is re-sent most, and where folding pays: the DeepSeek
- * adapter emits `reasoning_content` only on tool-call turns, and the measured
- * plain-turn share is negligible (see the module header). Restricting to this
- * shape keeps the policy route-independent.
+ * This is a **policy** filter, not a token-accounting claim. Reasoning is re-sent
+ * differently per route:
+ *
+ * - `dsh-llm-deepseek`'s `serializeAssistant` emits `reasoning_content` only when
+ *   `toolCalls.length > 0` ("it is ignored on plain turns, so we drop it there"),
+ *   so a plain turn's reasoning is free on that route.
+ * - `dsh-router-core`'s `wireMessages` — the route this profile actually runs —
+ *   does **not** gate it: `...reasoning.length > 0 ? { reasoning_content } : {}`
+ *   is unconditional, so plain-turn reasoning IS re-sent and does cost tokens.
+ *
+ * Restricting to tool-call turns therefore leaves real bytes on the table on the
+ * router route. It stays the default only because the conservative shape matches
+ * phase 1's "completed stage" intent and the measured tool-call share dominates;
+ * `foldPlainTurnReasoning` widens it for routes that replay plain-turn reasoning.
  *
  * @param content - assistant content blocks.
  * @returns true when the message carries at least one tool call.
@@ -192,7 +223,10 @@ export function planReasoningFolds(
 ): ReasoningPlan[] {
   const plans: ReasoningPlan[] = []
   for (const node of candidates) {
-    if (!isToolCallTurn(node.content)) continue
+    // Plain turns fold only when the route re-sends their reasoning (see
+    // `isToolCallTurn`): on dsh-llm-deepseek that reasoning never leaves the
+    // process, so folding it would shrink the log view without saving a token.
+    if (!isToolCallTurn(node.content) && !config.foldPlainTurnReasoning) continue
     const aged = node.turn < currentTurn || currentStep - node.step >= config.staleSteps
     if (!aged) continue
     if (node.step > currentStep - config.keepRecentSteps) continue
@@ -267,18 +301,45 @@ export function reasoningCandidates(session: Session): ReasoningCandidate[] {
 }
 
 /**
- * Append one decision event recording the planned folds.
+ * Append one decision record covering the planned folds.
  *
- * The decision is durable and pure: replaying the log through the registered
- * projection reproduces exactly the same request content, which is what makes
- * this replay-safe without touching the append-only log.
+ * The record is self-describing: it stores the exact content indexes it covers,
+ * so replay never has to re-derive *which* blocks were chosen from a count. The
+ * record is durable and pure — replaying the log through the registered
+ * projection reproduces exactly the same request content.
  *
  * @param session - session to extend.
  * @param plans - folds to record.
+ * @returns the record's sequence number.
  */
-export function recordReasoningFolds(session: Session, plans: readonly ReasoningPlan[]): void {
-  const targets: ReasoningTarget[] = plans.map((plan) => ({ seq: plan.seq, chars: [...plan.chars] }))
-  session.append(REASONING_EVENT, { targets })
+export function recordReasoningFolds(session: Session, plans: readonly ReasoningPlan[]): SessionSeq {
+  const targets: ReasoningTarget[] = plans.map((plan) => ({ seq: plan.seq, indexes: [...plan.indexes], chars: [...plan.chars] }))
+  return appendPluginRecord(session, REASONING_EVENT, { targets })
+}
+
+/**
+ * Read every decision record in a log.
+ *
+ * Records are read back through {@link pluginRecordOf}, which validates that the
+ * type carries the `plugin:` prefix; the owner still validates `data` before use,
+ * because a restored record carries whatever an earlier build wrote.
+ *
+ * @param session - session to inspect.
+ * @returns decisions in log order, with unreadable payloads dropped.
+ */
+export function reasoningDecisions(session: Session): ReasoningFoldData[] {
+  const decisions: ReasoningFoldData[] = []
+  for (const event of session.snapshotEvents()) {
+    // Plugin-record types are outside `SessionEventType`, so the union has no
+    // member to narrow to; the runtime check is the only discriminator.
+    if ((event.type as string) !== REASONING_EVENT) continue
+    const record = pluginRecordOf(event as never)
+    if (record === undefined) continue
+    const data = record.data as ReasoningFoldData
+    if (typeof data !== 'object' || data === null || !Array.isArray(data.targets)) continue
+    decisions.push(data)
+  }
+  return decisions
 }
 
 /**
@@ -297,19 +358,47 @@ export function recordReasoningFolds(session: Session, plans: readonly Reasoning
  * reasoning blocks, which keeps replay correct even after a later decision has
  * already folded a sibling block.
  */
-export const reasoningProjection: SessionMessageProjection<typeof REASONING_EVENT> = {
+/**
+ * The projection definition registered with `ctx.sessions`.
+ *
+ * **Why a cast is needed, and why it is correct:** `SessionMessageProjection<T>`
+ * constrains `T extends keyof SessionEventMap`, so the host's *types* do not
+ * admit a `plugin:` record type. The *runtime* does: `SurfaceManager` resolves a
+ * projection with `projections.find(item => item.type === event.type)` **before**
+ * it looks at `surfaceOp`, so any committed event type can drive one. The cast is
+ * therefore only widening a compile-time parameter that the implementation
+ * already accepts.
+ *
+ * A projection must **not** be registered for a surface event type
+ * (`assistant/message`, `user/message`, `tool/result`): `planSurfaceEvent`
+ * returns a `project` plan *instead of* an append/replace plan, and
+ * `applySurfacePlan` only pushes nodes for `append`, so such a registration would
+ * silently drop every message of that type off the surface. A non-surface
+ * plugin-owned record is the only correct carrier.
+ *
+ * It is deliberately **tolerant of stale targets** rather than strict: a
+ * decision is durable, but the surface it referred to is not frozen — a
+ * `compaction` replacement can remove a node the decision named. Throwing there
+ * would make every later derivation fail and brick the session, which violates
+ * the design's "a session never errors" anti-goal.
+ */
+export const reasoningProjection = {
   type: REASONING_EVENT,
   project(event: SessionEvent, context: SessionMessageProjectionContext): ReadonlyMap<SessionSeq, Message> {
     const data = event.data as ReasoningFoldData
     if (typeof data !== 'object' || data === null || !Array.isArray(data.targets) || data.targets.length === 0) {
-      throw new Error('context-fold: reasoning decision must carry a non-empty targets array')
+      // A record with no targets describes no fold. It cannot be applied, but it
+      // also cannot change any message, so refusing it here would only break
+      // derivation for no benefit — the record is skipped by returning nothing.
+      return new Map()
     }
     const nodes = new Set(context.nodes)
     const updates = new Map<SessionSeq, Message>()
     for (const target of data.targets) {
       if (typeof target !== 'object' || target === null) continue
-      if (!Number.isSafeInteger(target.seq) || !Array.isArray(target.chars) || target.chars.length === 0) continue
-      // A stale target is not an error: see the tolerance note above.
+      if (!Number.isSafeInteger(target.seq) || !Array.isArray(target.indexes) || target.indexes.length === 0) continue
+      // A stale target is not an error: a compaction may have shadowed the node,
+      // and throwing would fail every later derivation.
       if (!nodes.has(target.seq) || updates.has(target.seq)) continue
       // `context.messages` holds only *previously projected* messages, so an
       // untouched assistant node falls back to its own durable event, exactly as
@@ -318,20 +407,19 @@ export const reasoningProjection: SessionMessageProjection<typeof REASONING_EVEN
       if (source?.type !== 'assistant/message') continue
       const message = context.messages.get(target.seq) ?? source.data.message
       if (message.role !== 'assistant') continue
-      const chosen: number[] = []
-      for (const [index, block] of message.content.entries()) {
-        if (chosen.length === target.chars.length) break
-        if (block.type !== 'reasoning') continue
+      // Fold exactly the recorded indexes that still name an unfoldable reasoning
+      // block. The record is authoritative about *which* blocks, so this never
+      // depends on positional re-derivation.
+      const indexes: number[] = []
+      for (const index of target.indexes) {
+        const block = message.content[index]
+        if (block === undefined || block.type !== 'reasoning') continue
         if (isFoldedReasoning(block.text)) continue
         if (foldReasoningText(block.text) === undefined) continue
-        chosen.push(index)
+        indexes.push(index)
       }
-      if (chosen.length === 0) continue
-      const projected = projectReasoning(message, chosen)
-      // The decision may not apply to a message from a different provider route,
-      // but block count and types are preserved either way, so a partial fold is
-      // still a valid projection.
-      updates.set(target.seq, projected)
+      if (indexes.length === 0) continue
+      updates.set(target.seq, projectReasoning(message, indexes))
     }
     return updates
   },

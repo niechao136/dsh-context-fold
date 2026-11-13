@@ -76,6 +76,7 @@ Batch head: a0f9 (callId) — lists 1 more result from this batch.
     staleSteps: 12           # 单回合内的年龄阈值
     batchSpanSteps: 20       # 超长回合按连续 step 区间切批
     foldReasoning: true      # 折叠历史 tool-call 回合的 reasoning（第二阶段）
+    foldPlainTurnReasoning: false  # 额外折叠普通回合；router 路由应设为 true
     enabled: true
     dryRun: false            # 只算不改，候选与阈值写到日志
 ```
@@ -128,41 +129,73 @@ Re-read signals: 1 across 1 folded node(s)
 
 ## 第二阶段：reasoning 折叠
 
-助手思考过程是窗口里第二贵的东西。两个决定性实测事实决定了做法：
+助手思考过程是窗口里第二贵的东西。以下事实都是实测/读代码确认的，不是推测。
 
-1. **只有 tool-call 回合的 reasoning 会真的重发。** DeepSeek adapter 的 `serializeAssistant`
-   只在消息同时带 tool_calls 时才写 `reasoning_content`（普通回合的 reasoning 被主动丢弃）。
-   所以普通回合的 reasoning 折叠**收益为零**，直接跳过。实测三份真实会话：
-   tool-call 回合的 reasoning 占 surface 的 12–19%，普通回合只占 0.03–2.7%。
-2. **`assistant/message` 根本不能做 surface 替换。** 宿主强制替换必须引用所有被遮蔽节点，
-   但 assistant 消息「embeds its source stream」不允许带 `sourceEventSeqs`。
-   所以 phase 1 的替换协议在这里结构上不可用。
+### 为什么不用 phase 1 的替换协议
 
-替代方案是宿主官方给的**消息投影**（`ctx.sessions.registerMessageProjection`，
-`dsh-compaction-image-offload` 用它处理图片）：
+**`assistant/message` 根本不能做 surface 替换**：宿主强制替换必须引用所有被遮蔽节点，
+但 assistant 消息「embeds its source stream」不允许带 `sourceEventSeqs`。
+不是难，是结构上不可能。
 
-- 追加一条持久决策事件 `context-fold/reasoning`，指明折哪个节点的几个 reasoning 块；
-- 注册一个纯函数投影，在 `deriveMessages()`（也就是组请求的消息来源）时把 reasoning
-  换成 `240 字原文开头 + 省略说明`；
-- **日志一个字节不改**，原文永远在 append-only 事件里，块数量与块类型保持不变，
-  所以 replay 校验依然成立。
+### 替代机制：消息投影 + plugin record
 
-规则：`MIN_REASONING_CHARS = 1200`（低于它标记本身比正文还长）、保留原文开头 240 字
-（不发明任何内容，开头是原文的真前缀）、沿用 phase 1 的年龄与「最近 N 步不动」规则、
-带标记的块永不二次折叠。
+宿主官方给的是**消息投影**（`ctx.sessions.registerMessageProjection`）：追加一条持久
+决策记录，在 `deriveMessages()`（也就是组请求的消息来源）时把 reasoning 换成
+`240 字原文开头 + 省略说明`。日志一个字节不改。
+
+**一个必须说清的关键修正**：持久记录必须用 `appendPluginRecord`，**不能用** `session.append`。
+
+`dsh-compaction-image-offload` 不是「自己发明事件类型」的先例——`image/offload` 是
+harness **核心**事件（在 `KNOWN_SESSION_EVENT_TYPES` 里），下游插件无法加入那个集合，
+`SessionEventMap` 增强只影响 TypeScript。
+
+而 `session.append` 写出的信封只有 `{type, seq, time, data}`，没有 `ignorable`；持久化
+读取路径会因此拒绝整条日志：
+
+> "contains event type … unknown to this harness and not marked ignorable; refusing to interpret the log"
+
+也就是说，**用户只要折过一次 reasoning，会话就再也打不开**——正常使用就会丢光对话。
+这个缺陷在第一版实现里真实存在过。`appendPluginRecord` 会打上 `ignorable: true`，
+老版本读取器会保留并跳过该记录，而 `reasoningProjection` 依然能从它驱动
+`deriveMessages()`（已端到端验证）。
+
+### 规则
+
+- 规则驱动，零模型调用；带标记的块永不二次折叠。
+- `MIN_REASONING_CHARS = 1200`（低于它标记本身比正文还长），保留原文开头 240 字
+  ——是真前缀，不发明任何内容。
+- 沿用 phase 1 的年龄与「最近 N 步不动」规则。
+- 决策记录**自描述**：存的是内容索引，不是「折几个」的计数，所以回放不依赖位置重推。
+
+### 按路由决定折哪些回合
+
+哪些回合的 reasoning 会真的重发，取决于序列化器：
+
+| 路由 | 普通回合的 reasoning | 默认 |
+| --- | --- | --- |
+| `dsh-llm-deepseek` | 丢弃（只在有 tool_calls 时发） | 折了没有收益 |
+| `dsh-router-core`（本 profile 实际在跑） | **无条件发送** | 折了是真省钱 |
+
+所以：`foldReasoning`（默认开）折 tool-call 回合；`foldPlainTurnReasoning`（默认关）
+额外折普通回合——在 router 路由上应当打开。
+
+### 失败策略
 
 投影对**过期目标宽容**：compaction 可能遮蔽决策点名的节点，此时抛错会让之后每一次
-`deriveMessages()` 都失败、把会话彻底弄死；所以过期目标跳过而非报错。决策本身形状
-非法（空 `targets`）仍然直接抛错，坏日志不会静默少折。
+`deriveMessages()` 都失败。所以过期目标跳过而非报错；记录本身形状非法也只是一条无效
+记录（不影响派生），因为**已经落盘的日志不能因为新版本校验变严就变得读不出来**。
 
-投影**即使 `foldReasoning: false` 也注册**：开关只该管**新**决策，日志里已有决策的会话
-应当继续享受它已经被计费的收益。实测也确认了容错边界——**没有投影时不是报错**，
-`deriveMessages()` 会退回未折叠的原文（实测 4000 字 vs 332 字），所以日志永远不会
-因为缺投影而读不出来。宿主同一事件类型只允许注册一次，重复注册会被捕获并告警，
-不会让 `apply()` 抛错。
+投影**即使 `foldReasoning: false` 也注册**：开关只该管**新**决策，日志里已有决策的
+会话应当继续享受它已经被计费的收益。实测也确认：没有投影时不报错，`deriveMessages()`
+退回未折叠的原文（4000 字 vs 332 字）。宿主同一事件类型只允许注册一次，重复注册会被
+捕获并告警，不会让 `apply()` 抛错。
 
-**已知缺口**：phase 2 不写 spill 文件。原文可从日志恢复，但没有「一跳可达」的
-`read`/`grep` 路径，链式召回对 reasoning 尚未成立（设计文档 §12.7）。
+### 已知缺口
+
+**phase 2 不写 spill 文件。** 原文可从日志恢复，但标记里没有「一跳可达」的
+`read`/`grep` 路径——这是一个指向虚无的指针，比 phase 1 的取舍更糟，因为它会让模型
+**以为**细节可恢复。补法是在折叠时同步 `saveText` 并把路径内联进标记，让两种折叠共用
+同一条召回链（设计文档 §12.7）。
 
 ## 开发
 

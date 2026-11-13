@@ -22,6 +22,15 @@ export interface ContextFoldConfig {
   batchSpanSteps: number
   /** Fold reasoning blocks on historical tool-call turns (phase 2). */
   foldReasoning: boolean
+  /**
+   * Also fold reasoning on plain (non-tool-call) turns.
+   *
+   * Off by default because `dsh-llm-deepseek` drops plain-turn reasoning, so on
+   * that route folding it saves nothing. Turn it on for a route whose serializer
+   * re-sends plain-turn reasoning unconditionally (e.g. `dsh-router-core`), where
+   * it is a real saving.
+   */
+  foldPlainTurnReasoning: boolean
   /** Master switch; `false` means the plugin does nothing at all. */
   enabled: boolean
   /** Compute and report candidates without mutating anything. */
@@ -36,6 +45,7 @@ export const DEFAULT_CONFIG: Readonly<ContextFoldConfig> = deepFreeze({
   staleSteps: 12,
   batchSpanSteps: 20,
   foldReasoning: true,
+  foldPlainTurnReasoning: false,
   enabled: true,
   dryRun: false,
 })
@@ -76,6 +86,10 @@ export const Config = z.object({
     .boolean()
     .default(DEFAULT_CONFIG.foldReasoning)
     .description('Fold reasoning blocks on historical tool-call turns. Reasoning on plain turns is never re-sent, so it is not folded.'),
+  foldPlainTurnReasoning: z
+    .boolean()
+    .default(DEFAULT_CONFIG.foldPlainTurnReasoning)
+    .description('Also fold reasoning on plain turns. Enable when the route re-sends it (e.g. dsh-router-core); leave off for dsh-llm-deepseek, which drops it.'),
   enabled: z.boolean().default(DEFAULT_CONFIG.enabled).description('Turn folding on or off.'),
   dryRun: z.boolean().default(DEFAULT_CONFIG.dryRun).description('Compute and report candidates without mutating the session.'),
 })
@@ -95,11 +109,12 @@ export function resolveConfig(config: Partial<ContextFoldConfig> = {}): ContextF
     staleSteps: config.staleSteps ?? DEFAULT_CONFIG.staleSteps,
     batchSpanSteps: config.batchSpanSteps ?? DEFAULT_CONFIG.batchSpanSteps,
     foldReasoning: config.foldReasoning ?? DEFAULT_CONFIG.foldReasoning,
+    foldPlainTurnReasoning: config.foldPlainTurnReasoning ?? DEFAULT_CONFIG.foldPlainTurnReasoning,
     enabled: config.enabled ?? DEFAULT_CONFIG.enabled,
     dryRun: config.dryRun ?? DEFAULT_CONFIG.dryRun,
   }
   for (const [key, value] of Object.entries(resolved)) {
-    if (key === 'enabled' || key === 'dryRun' || key === 'foldReasoning') continue
+    if (key === 'enabled' || key === 'dryRun' || key === 'foldReasoning' || key === 'foldPlainTurnReasoning') continue
     assertInteger(key, value, key === 'minFoldChars' ? 300 : key === 'minBatchChars' ? 1 : 0)
   }
   if (resolved.staleSteps < 1) throw new Error(`context-fold: staleSteps (${resolved.staleSteps}) must be at least 1`)

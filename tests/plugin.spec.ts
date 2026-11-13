@@ -294,13 +294,13 @@ describe('reasoning folding is wired through the plugin', () => {
   it('registers its message projection', () => {
     const fake = fakeContext(services().map)
     apply(fake.ctx, config)
-    expect(fake.projections.map((projection) => projection.type)).toContain('context-fold/reasoning')
+    expect(fake.projections.map((projection) => String(projection.type))).toContain('plugin:context-fold/reasoning')
   })
 
   it('registers the projection even when reasoning folding is disabled, so old logs stay readable', () => {
     const fake = fakeContext(services().map)
     apply(fake.ctx, resolveConfig({ ...config, foldReasoning: false }))
-    expect(fake.projections.map((projection) => projection.type)).toContain('context-fold/reasoning')
+    expect(fake.projections.map((projection) => String(projection.type))).toContain('plugin:context-fold/reasoning')
   })
 
   it('records no reasoning decision while disabled', async () => {
@@ -308,7 +308,7 @@ describe('reasoning folding is wired through the plugin', () => {
     const fake = fakeContext(services().map)
     apply(fake.ctx, resolveConfig({ ...config, foldReasoning: false }))
     await fake.emit('agent/turn-stopping', { agent: agentOn(session), turn: 1, signal: new AbortController().signal })
-    expect(session.snapshotEvents().some((event) => event.type === 'context-fold/reasoning')).toBe(false)
+    expect(session.snapshotEvents().some((event) => (event.type as string) === 'plugin:context-fold/reasoning')).toBe(false)
   })
 
   it('warns instead of throwing when the same projection is registered twice', () => {
@@ -349,7 +349,7 @@ describe('reasoning folding is wired through the plugin', () => {
     // later steps, so any recency window would classify turn 1 as in-use.
     apply(fake.ctx, resolveConfig({ ...config, keepRecentSteps: 0, foldReasoning: true }))
     await fake.emit('agent/turn-stopping', { agent: agentOn(session), turn: 2, signal: new AbortController().signal })
-    const decision = session.snapshotEvents().find((event) => event.type === 'context-fold/reasoning')
+    const decision = session.snapshotEvents().find((event) => (event.type as string) === 'plugin:context-fold/reasoning')
     expect(decision).toBeDefined()
     expect(fake.logs.some((line) => line.includes('folded reasoning'))).toBe(true)
   })

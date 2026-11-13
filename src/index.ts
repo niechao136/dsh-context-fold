@@ -195,12 +195,15 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
   // govern only *new* decisions: a session whose log already carries them keeps
   // the benefit it was already charged for.
   ctx.inject(['sessions'], (scope) => {
-    const sessions = (scope as { sessions?: { registerMessageProjection(projection: typeof reasoningProjection): () => Promise<void> } }).sessions
+    const sessions = (scope as unknown as { sessions?: { registerMessageProjection(projection: unknown): () => Promise<void> } }).sessions
     if (sessions === undefined || typeof sessions.registerMessageProjection !== 'function') {
       ctx.logger.warn('context-fold: no ctx.sessions.registerMessageProjection; reasoning folds stay inactive')
       return
     }
     try {
+      // The host types constrain a projection to `keyof SessionEventMap`, which
+      // cannot express a plugin-record carrier; the runtime accepts any event
+      // type (see the reasoning module header).
       sessions.registerMessageProjection(reasoningProjection)
     } catch (error) {
       // The host allows exactly one definition per event type, and `apply()` can

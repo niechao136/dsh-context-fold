@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
-import { Session } from '@deepseek-ai/dsh-session'
+import { appendPluginRecord, Session } from '@deepseek-ai/dsh-session'
 import { resolveConfig } from '../src/config.ts'
 import { renderReport, reportOf } from '../src/measure.ts'
 import {
+  REASONING_EVENT,
   REASONING_MARKER,
   foldReasoningText,
   isFoldedReasoning,
@@ -57,7 +58,7 @@ describe('foldReasoningText', () => {
 })
 
 function sessionWithOldToolTurn(): Session {
-  const session = Session.create('reason-1' as never, undefined, undefined, undefined, [reasoningProjection])
+  const session = Session.create('reason-1' as never, undefined, undefined, undefined, [reasoningProjection as never])
   session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
   const assistant = createAssistantMessage({
     content: [{ type: 'reasoning', text: LONG }, { type: 'tool-call', id: 'call_1' as never, name: 'read', arguments: '{}' }],
@@ -83,7 +84,10 @@ describe('planReasoningFolds', () => {
     expect(planReasoningFolds(reasoningCandidates(session), 2, 3, config).length).toBe(0)
   })
 
-  it('skips a plain turn, whose reasoning is not re-sent', () => {
+  it('skips a plain turn by default, but folds it when the route re-sends its reasoning', () => {
+    // `dsh-llm-deepseek` drops plain-turn reasoning; `dsh-router-core` does not.
+    // The default therefore saves nothing on the former and the opt-in captures
+    // the real bytes on the latter.
     const session = Session.create('reason-plain' as never)
     session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
     const assistant = createAssistantMessage({
@@ -92,6 +96,7 @@ describe('planReasoningFolds', () => {
     })
     session.append('assistant/message', { turn: 1, step: 1, message: assistant, stream: [] }, { surfaceOp: 'append' })
     expect(planReasoningFolds(reasoningCandidates(session), 2, 9, config).length).toBe(0)
+    expect(planReasoningFolds(reasoningCandidates(session), 2, 9, resolveConfig({ foldPlainTurnReasoning: true })).length).toBe(1)
   })
 
   it('does not plan a message it already folded', () => {
@@ -148,7 +153,7 @@ describe('reasoningProjection', () => {
   it('survives a restore through a replay of the same log', () => {
     const session = sessionWithOldToolTurn()
     recordReasoningFolds(session, planReasoningFolds(reasoningCandidates(session), 2, 9, resolveConfig()))
-    const restored = Session.create('reason-1' as never, session.snapshotEvents() as never, undefined, undefined, [reasoningProjection])
+    const restored = Session.create('reason-1' as never, session.snapshotEvents() as never, undefined, undefined, [reasoningProjection as never])
     expect(JSON.stringify(restored.deriveMessages())).toContain(REASONING_MARKER)
   })
 
@@ -170,13 +175,16 @@ describe('reasoningProjection', () => {
     // A target whose seq is not a current node must be skipped: a compaction may
     // have shadowed the node, and throwing would brick every later request.
     const session = sessionWithOldToolTurn()
-    session.append('context-fold/reasoning', { targets: [{ seq: 999 as never, chars: [1] }] })
+    recordReasoningFolds(session, [{ seq: 999 as never, indexes: [0], chars: [1], charsRemoved: 1 }])
     expect(() => session.deriveMessages()).not.toThrow()
   })
 
-  it('rejects a malformed decision so a corrupt log fails loudly', () => {
+  it('tolerates a malformed record instead of breaking derivation', () => {
+    // An already-persisted record must never make the log unreadable, even if a
+    // later build tightened validation: derivation skips it and keeps working.
     const session = sessionWithOldToolTurn()
-    expect(() => session.append('context-fold/reasoning', { targets: [] })).toThrow()
+    appendPluginRecord(session, REASONING_EVENT, { targets: [] } as never)
+    expect(() => session.deriveMessages()).not.toThrow()
   })
 })
 

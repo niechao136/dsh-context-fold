@@ -12,6 +12,7 @@
  */
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { FOLD_MARKER, isFoldedText } from './format.ts'
+import { REASONING_EVENT } from './reasoning.ts'
 import { codePointLength } from './rules.ts'
 import { currentNode } from './session.ts'
 
@@ -99,33 +100,44 @@ export function reportOf(session: Session): FoldReport {
 }
 
 /**
- * Derive reasoning folds from their durable decision events.
+ * Derive reasoning folds from their durable decision records.
  *
- * The decision stores the original size; the current size is read back through
- * the projection, so the report shows what the request actually pays rather than
- * what was intended.
+ * Only the folded blocks are measured, so a message that intentionally keeps a
+ * short reasoning block does not have that block's characters attributed to the
+ * fold. Rows are keyed by `seq` + block index: two decisions may legitimately
+ * cover different blocks of one message, but a repeated decision for the same
+ * block must not be counted twice.
  *
  * @param session - session to inspect.
  * @param events - the session's event log.
- * @returns one record per folded message, in decision order.
+ * @returns one record per folded block, in decision order.
  */
 function reasoningFoldsOf(session: Session, events: readonly SessionEvent[]): ReasoningFoldRecord[] {
   const records: ReasoningFoldRecord[] = []
+  const seen = new Set<string>()
   for (const event of events) {
-    if (event.type !== 'context-fold/reasoning') continue
-    const data = event.data as { targets?: readonly { seq: number; chars: readonly number[] }[] }
+    // Plugin-record types are outside `SessionEventType`, so there is no union
+    // member to narrow to; compare as a plain string.
+    if ((event.type as string) !== REASONING_EVENT) continue
+    const data = event.data as { targets?: readonly { seq: number; indexes?: readonly number[]; chars?: readonly number[] }[] }
     for (const target of data.targets ?? []) {
+      const indexes = target.indexes ?? []
       const message = session.eventAt(target.seq as never)
       const derived = message === undefined ? null : session.deriveEventMessage(message)
-      const folded = derived === null || derived.role !== 'assistant'
-        ? 0
-        : derived.content.reduce((total, block) => total + (block.type === 'reasoning' ? codePointLength(block.text) : 0), 0)
-      records.push({
-        seq: target.seq,
-        blocks: target.chars.length,
-        charsBefore: target.chars.reduce((total, chars) => total + chars, 0),
-        charsAfter: folded,
-      })
+      if (derived === null || derived.role !== 'assistant') continue
+      for (const [position, index] of indexes.entries()) {
+        const key = `${target.seq}:${index}`
+        if (seen.has(key)) continue
+        const block = derived.content[index]
+        if (block === undefined || block.type !== 'reasoning') continue
+        seen.add(key)
+        records.push({
+          seq: target.seq,
+          blocks: 1,
+          charsBefore: target.chars?.[position] ?? codePointLength(block.text),
+          charsAfter: codePointLength(block.text),
+        })
+      }
     }
   }
   return records
