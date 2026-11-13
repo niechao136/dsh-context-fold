@@ -487,9 +487,13 @@ The projection is deliberately **tolerant of stale targets**: a `compaction` rep
 
 The decision's own shape *is* validated strictly (non-empty `targets`), so a corrupt log still fails loudly rather than silently under-folding.
 
-### 12.6 Wiring is unconditional
+### 12.6 Wiring is unconditional, and a missing projection is inert
 
-The projection is registered **even when `foldReasoning: false`**. The decision events are durable, and a session whose log already contains them refuses further derivation without its owning projection. The flag only stops *new* decisions from being recorded; it cannot make an old log unreadable.
+The projection is registered **even when `foldReasoning: false`**, because the flag should govern only *new* decisions: a session whose log already carries them keeps the benefit it was already charged for.
+
+**Verified, correcting an assumption in the first draft:** an unregistered decision event is **inert, not fatal**. `deriveMessages()` does not refuse derivation — it falls back to the original unfolded reasoning (measured: 4000 chars returned instead of 332). So a log can never be bricked by a missing projection; the fold simply stops applying. Registration is therefore about *keeping a benefit*, not about *avoiding breakage*.
+
+The host permits exactly one definition per event type, and `apply()` can run twice (a reload, or two config rows naming the same package). A duplicate registration is caught and warned about rather than thrown out of `apply()`: the first registration is already live and correct.
 
 ### 12.7 Still open for phase 2
 

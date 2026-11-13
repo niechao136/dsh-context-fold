@@ -152,6 +152,20 @@ describe('reasoningProjection', () => {
     expect(JSON.stringify(restored.deriveMessages())).toContain(REASONING_MARKER)
   })
 
+  it('is inert, not fatal, when the projection is not registered', () => {
+    // Verified against the host: a decision event with no owning projection does
+    // not make derivation fail — `deriveMessages()` falls back to the original,
+    // unfolded reasoning. This is what guarantees a log can never be bricked by a
+    // missing registration, so it is pinned here rather than assumed.
+    const session = sessionWithOldToolTurn()
+    recordReasoningFolds(session, planReasoningFolds(reasoningCandidates(session), 2, 9, resolveConfig()))
+    const restored = Session.create('reason-1' as never, session.snapshotEvents() as never)
+    const assistant = restored.deriveMessages().find((message) => message.role === 'assistant')!
+    const reasoning = assistant.content.filter((block) => block.type === 'reasoning')[0] as { text: string }
+    expect(reasoning.text).toBe(LONG)
+    expect(reasoning.text.startsWith(REASONING_MARKER)).toBe(false)
+  })
+
   it('tolerates a stale target instead of throwing', () => {
     // A target whose seq is not a current node must be skipped: a compaction may
     // have shadowed the node, and throwing would brick every later request.

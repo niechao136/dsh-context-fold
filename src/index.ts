@@ -185,18 +185,30 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
     })
   })
 
-  // Register the reasoning projection unconditionally, even when
-  // `foldReasoning` is off: the decision events are durable, and a session whose
-  // log already contains them refuses further derivation without its owning
-  // projection ("load its owning plugin"). Registering always keeps old logs
-  // readable; the flag only stops *new* decisions being recorded.
+  // Register the reasoning projection unconditionally, including when
+  // `foldReasoning: false`.
+  //
+  // Verified behaviour, not assumed: an unregistered decision event is inert
+  // rather than fatal — `deriveMessages()` falls back to the original, unfolded
+  // reasoning (measured: 4000 chars instead of 332). So the log always stays
+  // readable. Registering unconditionally is still right because the flag should
+  // govern only *new* decisions: a session whose log already carries them keeps
+  // the benefit it was already charged for.
   ctx.inject(['sessions'], (scope) => {
     const sessions = (scope as { sessions?: { registerMessageProjection(projection: typeof reasoningProjection): () => Promise<void> } }).sessions
     if (sessions === undefined || typeof sessions.registerMessageProjection !== 'function') {
-      ctx.logger.warn('context-fold: no ctx.sessions.registerMessageProjection; reasoning folds in an existing log cannot be projected')
+      ctx.logger.warn('context-fold: no ctx.sessions.registerMessageProjection; reasoning folds stay inactive')
       return
     }
-    sessions.registerMessageProjection(reasoningProjection)
+    try {
+      sessions.registerMessageProjection(reasoningProjection)
+    } catch (error) {
+      // The host allows exactly one definition per event type, and `apply()` can
+      // run twice (a reload, or two rows naming the same package). A duplicate is
+      // not a mount failure: the first registration is already live and correct,
+      // so warn instead of throwing out of `apply()`.
+      ctx.logger.warn(`context-fold: reasoning projection not registered: ${error instanceof Error ? error.message : String(error)}`)
+    }
   })
 
   ctx.on('session/disposed', (session) => {

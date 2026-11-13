@@ -311,6 +311,31 @@ describe('reasoning folding is wired through the plugin', () => {
     expect(session.snapshotEvents().some((event) => event.type === 'context-fold/reasoning')).toBe(false)
   })
 
+  it('warns instead of throwing when the same projection is registered twice', () => {
+    // `apply()` can run twice (a reload, or two rows naming the same package) and
+    // the host allows one definition per event type. A duplicate must not escape
+    // `apply()` as a throw: the first registration is already live and correct.
+    const fake = fakeContext(services().map)
+    let registered = 0
+    const scope = {
+      commands: { register: () => () => {} },
+      sessions: {
+        registerMessageProjection() {
+          registered += 1
+          if (registered > 1) throw new Error('session message projection "context-fold/reasoning" is already registered')
+          return async () => {}
+        },
+      },
+    }
+    ;(fake.ctx as unknown as { inject: (names: string[], cb: (s: unknown) => void) => void }).inject = (_names, callback) => callback(scope)
+    expect(() => apply(fake.ctx, config)).not.toThrow()
+    expect(registered).toBe(1)
+    // A second mount hits the duplicate and must warn, not throw.
+    expect(() => apply(fake.ctx, config)).not.toThrow()
+    expect(registered).toBe(2)
+    expect(fake.logs.some((line) => line.includes('already registered'))).toBe(true)
+  })
+
   it('records a reasoning decision for an aged tool-call turn', async () => {
     const session = Session.create('plug-reason' as never)
     session.append('user/message', createUserMessage({ content: text('go'), source: { kind: 'user' } }), { surfaceOp: 'append' })
