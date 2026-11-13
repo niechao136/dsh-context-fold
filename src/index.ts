@@ -26,11 +26,25 @@ import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import { Config, resolveConfig, type ContextFoldConfig } from './config.ts'
 import { renderReport, reportOf } from './measure.ts'
 import type { FoldBatch } from './plan.ts'
+import { planReasoningFolds, reasoningCandidates, reasoningProjection, recordReasoningFolds } from './reasoning.ts'
 import { foldBatch, planFor, type FoldPassResult } from './session.ts'
 
 export { Config, resolveConfig, DEFAULT_CONFIG } from './config.ts'
 export type { ContextFoldConfig } from './config.ts'
 export { FOLD_MARKER, isFoldedText } from './format.ts'
+export {
+  REASONING_EVENT,
+  REASONING_MARKER,
+  foldReasoningText,
+  isFoldedReasoning,
+  isToolCallTurn,
+  planReasoningFolds,
+  projectReasoning,
+  reasoningCandidates,
+  reasoningProjection,
+  recordReasoningFolds,
+} from './reasoning.ts'
+export type { ReasoningCandidate, ReasoningFoldData, ReasoningPlan, ReasoningTarget } from './reasoning.ts'
 export { conclude, codePointLength, isFoldableContent, parseSpillNotice, textOf } from './rules.ts'
 export { planFolds } from './plan.ts'
 export type { FoldBatch, FoldDecision, FoldPlan, NodeSnapshot, SkippedNode } from './plan.ts'
@@ -101,9 +115,28 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
         return undefined
       }
       const decision = planFor(session, currentTurn, currentStep, config)
+      const reasoningPlans = config.foldReasoning
+        ? planReasoningFolds(reasoningCandidates(session), currentTurn, currentStep, config)
+        : []
       if (config.dryRun) {
         ctx.logger.info(describeDecision('dryRun: would fold', decision, config))
+        if (reasoningPlans.length > 0) {
+          const chars = reasoningPlans.reduce((total, plan) => total + plan.charsRemoved, 0)
+          ctx.logger.info(`dryRun: would fold reasoning in ${reasoningPlans.length} message(s), removing ${chars} chars`)
+        }
         return { decision, folded: [], failed: [], charsRemoved: 0 }
+      }
+      // Reasoning folding is recorded even when no tool batch qualifies: it is a
+      // pure projection with no spill write and no surface rewrite, so it has no
+      // dependency on the tool-fold decision.
+      if (reasoningPlans.length > 0) {
+        try {
+          recordReasoningFolds(session, reasoningPlans)
+          const chars = reasoningPlans.reduce((total, plan) => total + plan.charsRemoved, 0)
+          ctx.logger.info(`context-fold: folded reasoning in ${reasoningPlans.length} message(s), removed ${chars} chars`)
+        } catch (error) {
+          ctx.logger.warn(`context-fold: reasoning fold failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
       }
       if (decision.batches.length === 0) return { decision, folded: [], failed: [], charsRemoved: 0 }
       const folded = []
@@ -150,6 +183,20 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
       description: 'Report what dsh-context-fold has folded in this session, and how often the folded content was read again.',
       handler: (invocation) => ({ kind: 'success', text: renderReport(reportOf(invocation.agent.session), config.dryRun) }),
     })
+  })
+
+  // Register the reasoning projection unconditionally, even when
+  // `foldReasoning` is off: the decision events are durable, and a session whose
+  // log already contains them refuses further derivation without its owning
+  // projection ("load its owning plugin"). Registering always keeps old logs
+  // readable; the flag only stops *new* decisions being recorded.
+  ctx.inject(['sessions'], (scope) => {
+    const sessions = (scope as { sessions?: { registerMessageProjection(projection: typeof reasoningProjection): () => Promise<void> } }).sessions
+    if (sessions === undefined || typeof sessions.registerMessageProjection !== 'function') {
+      ctx.logger.warn('context-fold: no ctx.sessions.registerMessageProjection; reasoning folds in an existing log cannot be projected')
+      return
+    }
+    sessions.registerMessageProjection(reasoningProjection)
   })
 
   ctx.on('session/disposed', (session) => {

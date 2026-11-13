@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-12
 **Status:** awaiting approval
-**Scope of this document:** phase 1 (tool-result folding). Reasoning folding is phase 2 and is only sketched here.
+**Scope of this document:** phase 1 (tool-result folding) and phase 2 (reasoning folding, §12). Phases 3–4 are sketched only.
 
 ---
 
@@ -43,7 +43,7 @@ Default compaction fails even storage-lossless (an LLM summary replaces the span
 - Replacing `compaction-basic`. Folding is additive; compaction still handles true overflow.
 - Cross-session recall. That is `dsh-recall`'s job and is explicitly out of scope here (see §4, rejected approach D).
 - Folding user messages or assistant text.
-- Folding reasoning blocks (phase 2).
+- Folding reasoning blocks — **now in scope as phase 2 (§12)**, via a message projection rather than a surface rewrite.
 
 ### Anti-goals — what would make this a failure even if it "works"
 
@@ -363,7 +363,7 @@ Consequences:
 
 ### 6.8 What is deliberately not touched
 
-- Assistant messages, including reasoning and tool-call arguments (phase 2).
+- Assistant message **text** and tool-call arguments. (Reasoning blocks are folded in phase 2 through a message projection — see §12 — which never rewrites the log.)
 - User messages.
 - System prompt nodes.
 - Any node in the last `keepRecentSteps` steps.
@@ -428,11 +428,73 @@ Deliberately **not** in phase 1. The numbers can be computed from the session lo
 
 **Phase 1 (this design):** tool-result folding, deterministic rules, spill + chain roster, `dryRun`, measurement. No UI, no reasoning.
 
-**Phase 2:** reasoning folding. Blocked on a verified approach to replay-state rewriting — `toPiAssistant` enforces `state.blocks[index].type === block.type` and throws `INVALID_REPLAY_STATE` otherwise; the `foreignAssistant` path is a legal but signature-losing fallback. Must be resolved before any implementation.
+**Phase 2:** reasoning folding. **Mechanism resolved and implemented** — see §12. The original blocker (replay-state rewriting) was based on a wrong assumption about the seam: `assistant/message` cannot be surface-replaced at all, but a registered **message projection** folds its content without touching the log.
 
 **Phase 3:** UI in `dsh-context`'s form.
 
 **Phase 4 (user's second priority):** cross-session recall. Only after 1–3, and only if it is not better served by `dsh-recall`.
+
+---
+
+## 12. Phase 2 — reasoning folding (implemented)
+
+This section supersedes the "blocked on replay-state rewriting" note in §9. Everything below was verified against the installed `0.2.2-rc.1` packages, and the behaviour is covered by `tests/reasoning.spec.ts`.
+
+### 12.1 The original blocker was the wrong constraint
+
+The first draft assumed reasoning folding required rewriting `SessionEventMap` replay state because `toPiAssistant` enforces `state.blocks[index].type === block.type`. Two corrections:
+
+1. **`assistant/message` cannot be surface-replaced at all.** In `0.2.2`, `assertSourceEventReferences` throws *"assistant/message embeds its source stream and cannot carry sourceEventSeqs"*, while a replacement must cite every shadowed node. So the phase-1 replace protocol is structurally unavailable for assistant messages — no amount of replay handling would make it work.
+2. **Replay signatures were not actually present.** Probing three real session logs (13,701 / 7,077 / 5,084 events) found `source.replayState === undefined` on *every* assistant message, across `deepseek-flash` and `codebuddy`. The provider branch of `toPiAssistant` is not on this path, so there was never a signature to preserve.
+
+### 12.2 The seam: a registered message projection
+
+`ctx.sessions.registerMessageProjection(def)` is the host's supported way for a plugin to change what a request sees **without changing the log**. `dsh-compaction-image-offload` ships exactly this pattern for `image/offload`, including the `declare module '@deepseek-ai/dsh-session/types'` augmentation that adds the plugin's event to `SessionEventMap`.
+
+Verified consequences:
+
+- `Session.deriveMessages()` is the source of request messages — `dsh-agent-loop` calls `this.buildRequest(..., this.session.deriveMessages(), ...)`.
+- Projections are applied in `deriveEventMessage`, cached per `contentGeneration`, and survive `Session.create` restore and fork when the definition is supplied.
+- The message count, identity, block count, and block types are all preserved, so this is compatible with the replay validation even on a signed route.
+
+**Design consequence:** the fold is a *pure function of the log plus the registered definition*, so replay is exact by construction. The full original reasoning stays in the append-only event.
+
+### 12.3 What reasoning actually costs — measured
+
+The DeepSeek adapter only re-sends reasoning on tool-call turns (`serializeAssistant`: `reasoning_content` is emitted only when `toolCalls.length > 0`, because it "is ignored on plain turns, so we drop it there"). Other routes do replay plain-turn reasoning — pi-ai's `foreignAssistant` maps *every* reasoning block to `{type:'thinking'}` — but the measured plain-turn share is negligible. Measuring three real sessions:
+
+| Session | Reasoning on tool-call turns | Reasoning on plain turns (already free) |
+|---|---|---|
+| foreman (2,118 assistant msgs) | 1,151 msgs, **981,533 chars** | 11 msgs, 42,563 chars |
+| super-agent A | 185 msgs, **195,145 chars** | 1 msg, 5,955 chars |
+| super-agent B | 345 msgs, **178,742 chars** | 6 msgs, 398 chars |
+
+So the addressable target is the tool-call-turn reasoning — ~12–19% of the surface. Plain-turn reasoning would be at most 0.03–2.7%, and on the DeepSeek route it is free already. Restricting to tool-call turns therefore captures essentially all of the win while staying correct on any route: on a route that *does* replay plain-turn reasoning we leave that small share on the table rather than risk folding a message whose reasoning is cheap to keep.
+
+### 12.4 Rules
+
+Deterministic, no model call, matching phase 1's contract:
+
+- **Only tool-call turns fold.** Plain-turn reasoning is free on the DeepSeek route and negligible elsewhere (0.03–2.7%), so including it would add risk for no measurable return.
+- **Head preserved verbatim.** 240 code points of the thought's opening stay inline, followed by an explicit `[… N chars of earlier reasoning omitted]` note. The head is a literal prefix of the original, so nothing is invented.
+- **`MIN_REASONING_CHARS = 1200`.** Below this the marker plus the note cost as much as the text.
+- **Age and recency reuse phase 1's rules** (`turn < currentTurn || age >= staleSteps`, and never within `keepRecentSteps`), so a single long turn has an exit and in-use content never moves.
+- **Idempotent by marker.** A block already starting with `[context-fold] [reasoning]` never folds again.
+
+### 12.5 Failure policy
+
+The projection is deliberately **tolerant of stale targets**: a `compaction` replacement can shadow a node a durable decision named. Throwing there would make every later `deriveMessages()` fail and brick the session — a direct violation of the "a session never errors" anti-goal. A target whose node is no longer current, or whose blocks are already folded, is skipped.
+
+The decision's own shape *is* validated strictly (non-empty `targets`), so a corrupt log still fails loudly rather than silently under-folding.
+
+### 12.6 Wiring is unconditional
+
+The projection is registered **even when `foldReasoning: false`**. The decision events are durable, and a session whose log already contains them refuses further derivation without its owning projection. The flag only stops *new* decisions from being recorded; it cannot make an old log unreadable.
+
+### 12.7 Still open for phase 2
+
+- **The spill path.** Phase 1 writes the full original to the spill store and inlines a path; phase 2 does not, because the assistant event *is* the original and is never rewritten. If the dumped reasoning needs to be re-readable through `read`/`grep` (not just replayable), a spill write must be added — currently the full text is recoverable only from the session log. This is a gap, not a bug: no conclusion is lost, but the chain-of-recall hop does not exist for reasoning yet.
+- **Interaction with `compaction-basic`.** A compaction span that covers an assistant node changes its surface seq, so a reasoning target pointing at the old seq goes stale and is skipped. Intended, but untested against a real `/compact`.
 
 ---
 

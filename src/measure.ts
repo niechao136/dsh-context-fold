@@ -45,6 +45,20 @@ export interface FoldReport {
   reReads: number
   /** How many of the folds were cited at least once. */
   rereadNodes: number
+  /** Reasoning folds recorded by decision events (phase 2). */
+  reasoningFolds: readonly ReasoningFoldRecord[]
+}
+
+/** One reasoning fold found in the log. */
+export interface ReasoningFoldRecord {
+  /** Message surface seq the decision named. */
+  seq: number
+  /** Reasoning blocks the decision covered. */
+  blocks: number
+  /** Original characters in those blocks. */
+  charsBefore: number
+  /** Characters the projected text currently occupies. */
+  charsAfter: number
 }
 
 const MARKER_HEADER = /^\[context-fold\] \[tool: ([^\]]+)\] ([\d,]+) chars folded at turn (\d+), step (\d+)\.( \(batch head\))?/
@@ -80,7 +94,41 @@ export function reportOf(session: Session): FoldReport {
     charsRemoved: folds.reduce((total, fold) => total + Math.max(0, fold.charsBefore - fold.charsAfter), 0),
     reReads: folds.reduce((total, fold) => total + fold.reReads, 0),
     rereadNodes: folds.filter((fold) => fold.reReads > 0).length,
+    reasoningFolds: reasoningFoldsOf(session, events),
   }
+}
+
+/**
+ * Derive reasoning folds from their durable decision events.
+ *
+ * The decision stores the original size; the current size is read back through
+ * the projection, so the report shows what the request actually pays rather than
+ * what was intended.
+ *
+ * @param session - session to inspect.
+ * @param events - the session's event log.
+ * @returns one record per folded message, in decision order.
+ */
+function reasoningFoldsOf(session: Session, events: readonly SessionEvent[]): ReasoningFoldRecord[] {
+  const records: ReasoningFoldRecord[] = []
+  for (const event of events) {
+    if (event.type !== 'context-fold/reasoning') continue
+    const data = event.data as { targets?: readonly { seq: number; chars: readonly number[] }[] }
+    for (const target of data.targets ?? []) {
+      const message = session.eventAt(target.seq as never)
+      const derived = message === undefined ? null : session.deriveEventMessage(message)
+      const folded = derived === null || derived.role !== 'assistant'
+        ? 0
+        : derived.content.reduce((total, block) => total + (block.type === 'reasoning' ? codePointLength(block.text) : 0), 0)
+      records.push({
+        seq: target.seq,
+        blocks: target.chars.length,
+        charsBefore: target.chars.reduce((total, chars) => total + chars, 0),
+        charsAfter: folded,
+      })
+    }
+  }
+  return records
 }
 
 /**
@@ -145,7 +193,15 @@ function searchableText(event: SessionEvent): string | undefined {
  */
 export function renderReport(report: FoldReport, dryRun: boolean): string {
   const lines = [`${FOLD_MARKER} ${report.folds.length} folded node(s) on the surface.`]
+  if (report.reasoningFolds.length > 0) {
+    const removed = report.reasoningFolds.reduce((total, fold) => total + Math.max(0, fold.charsBefore - fold.charsAfter), 0)
+    lines.push(`Reasoning folded in ${report.reasoningFolds.length} message(s): ${removed.toLocaleString('en-US')} chars removed.`)
+  }
   if (report.folds.length === 0) {
+    if (report.reasoningFolds.length > 0) {
+      if (dryRun) lines.push('dryRun is on: nothing is mutated; candidates are reported by the log line.')
+      return lines.join('\n')
+    }
     lines.push(dryRun ? 'dryRun is on: nothing is mutated; candidates are reported by the log line.' : 'Nothing has been folded in this session yet.')
     return lines.join('\n')
   }

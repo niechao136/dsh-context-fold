@@ -9,7 +9,14 @@ describe('resolveConfig', () => {
     expect(resolveConfig({}).keepRecentSteps).toBe(6)
     expect(resolveConfig({}).staleSteps).toBe(12)
     expect(resolveConfig({}).batchSpanSteps).toBe(20)
+    expect(resolveConfig({}).foldReasoning).toBe(true)
     expect(resolveConfig({}).dryRun).toBe(false)
+  })
+
+  it('lets reasoning folding be turned off without disabling the plugin', () => {
+    const config = resolveConfig({ foldReasoning: false })
+    expect(config.foldReasoning).toBe(false)
+    expect(config.enabled).toBe(true)
   })
 
   it('accepts partial overrides and keeps the rest', () => {

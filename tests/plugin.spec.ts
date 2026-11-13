@@ -34,10 +34,12 @@ function fakeContext(services: Record<string, unknown>): {
   emit(event: string, payload: unknown): Promise<void>
   logs: string[]
   commands: { name: string; description: string; handler: (invocation: unknown) => unknown }[]
+  projections: { type: string }[]
 } {
   const handlers = new Map<string, ((payload: unknown, next: () => Promise<unknown>) => Promise<unknown>)[]>()
   const logs: string[] = []
   const commands: { name: string; description: string; handler: (invocation: unknown) => unknown }[] = []
+  const projections: { type: string }[] = []
   const ctx = {
     on(event: string, handler: (payload: unknown, next: () => Promise<unknown>) => Promise<unknown>) {
       const list = handlers.get(event)
@@ -47,15 +49,24 @@ function fakeContext(services: Record<string, unknown>): {
     get(service: string) {
       return services[service]
     },
-    inject(_names: string[], callback: (scope: unknown) => void) {
-      callback({
+    inject(names: string[], callback: (scope: unknown) => void) {
+      const scope: Record<string, unknown> = {
         commands: {
           register(definition: { name: string; description: string; handler: (invocation: unknown) => unknown }) {
             commands.push(definition)
             return () => {}
           },
         },
-      })
+      }
+      if (names.includes('sessions')) {
+        scope.sessions = {
+          registerMessageProjection(projection: { type: string }) {
+            projections.push(projection)
+            return async () => {}
+          },
+        }
+      }
+      callback(scope)
     },
     logger: {
       info: (message: string) => logs.push(message),
@@ -66,6 +77,7 @@ function fakeContext(services: Record<string, unknown>): {
     ctx,
     logs,
     commands,
+    projections,
     async emit(event, payload) {
       for (const handler of handlers.get(event) ?? []) await handler(payload, async () => undefined)
     },
@@ -275,5 +287,45 @@ describe('folded node invariants under the plugin', () => {
     const report = reportOf(session)
     expect(report.folds).toHaveLength(2)
     for (const fold of report.folds) expect(fold.charsAfter).toBeLessThan(fold.charsBefore)
+  })
+})
+
+describe('reasoning folding is wired through the plugin', () => {
+  it('registers its message projection', () => {
+    const fake = fakeContext(services().map)
+    apply(fake.ctx, config)
+    expect(fake.projections.map((projection) => projection.type)).toContain('context-fold/reasoning')
+  })
+
+  it('registers the projection even when reasoning folding is disabled, so old logs stay readable', () => {
+    const fake = fakeContext(services().map)
+    apply(fake.ctx, resolveConfig({ ...config, foldReasoning: false }))
+    expect(fake.projections.map((projection) => projection.type)).toContain('context-fold/reasoning')
+  })
+
+  it('records no reasoning decision while disabled', async () => {
+    const session = sessionWithTurnOne()
+    const fake = fakeContext(services().map)
+    apply(fake.ctx, resolveConfig({ ...config, foldReasoning: false }))
+    await fake.emit('agent/turn-stopping', { agent: agentOn(session), turn: 1, signal: new AbortController().signal })
+    expect(session.snapshotEvents().some((event) => event.type === 'context-fold/reasoning')).toBe(false)
+  })
+
+  it('records a reasoning decision for an aged tool-call turn', async () => {
+    const session = Session.create('plug-reason' as never)
+    session.append('user/message', createUserMessage({ content: text('go'), source: { kind: 'user' } }), { surfaceOp: 'append' })
+    const assistant = createAssistantMessage({
+      content: [{ type: 'reasoning', text: 'r'.repeat(5000) }, { type: 'tool-call', id: 'call_r' as never, name: 'read', arguments: '{}' }],
+      source: { provider: 'test', model: 'test' },
+    })
+    session.append('assistant/message', { turn: 1, step: 1, message: assistant, stream: [] }, { surfaceOp: 'append' })
+    const fake = fakeContext(services().map)
+    // `keepRecentSteps: 0` isolates the age rule: this minimal session has no
+    // later steps, so any recency window would classify turn 1 as in-use.
+    apply(fake.ctx, resolveConfig({ ...config, keepRecentSteps: 0, foldReasoning: true }))
+    await fake.emit('agent/turn-stopping', { agent: agentOn(session), turn: 2, signal: new AbortController().signal })
+    const decision = session.snapshotEvents().find((event) => event.type === 'context-fold/reasoning')
+    expect(decision).toBeDefined()
+    expect(fake.logs.some((line) => line.includes('folded reasoning'))).toBe(true)
   })
 })

@@ -3,6 +3,7 @@
 > **Not an official DeepSeek product.** 第三方 DSH 插件，与 DeepSeek 官方无关。
 
 阶段边界的 tool 结果折叠：**结论留在窗口里，正文落到 spill 文件，一跳可达。**
+第二阶段再把历史 reasoning 折叠掉（见下文「第二阶段」）。
 
 长会话里最贵的东西不是历史，是「已经用完的正文还在每一步重发」。这个插件在阶段边界
 （回合结束，或单回合里结果已经够旧）把已完成的 tool 结果换成 `结论 + spill 路径 +
@@ -74,6 +75,7 @@ Batch head: a0f9 (callId) — lists 1 more result from this batch.
     keepRecentSteps: 6       # 最近 N 步永不折叠
     staleSteps: 12           # 单回合内的年龄阈值
     batchSpanSteps: 20       # 超长回合按连续 step 区间切批
+    foldReasoning: true      # 折叠历史 tool-call 回合的 reasoning（第二阶段）
     enabled: true
     dryRun: false            # 只算不改，候选与阈值写到日志
 ```
@@ -120,8 +122,44 @@ Re-read signals: 1 across 1 folded node(s)
 - 只按 `callId` / 工具名做引用检测。模型若用完全相同的参数**重跑原工具**来重读，
   这里检测不到（设计文档 §6.2 记录的已知缺口）；re-read 指标专门用来暴露它。
 - 图片与文件块不折叠：占位文本不是内容本身，phase 1 不拿附件换一句话。
-- 不折叠 assistant 文本、reasoning、user 消息、system prompt。
-- UI 与 reasoning 折叠分别是设计文档的 phase 3 与 phase 2，本包不含。
+- 不折叠 assistant 文本、user 消息、system prompt。
+- reasoning 折叠走**另一套机制**（消息投影，见下节），原文只留在日志里，不落 spill 文件。
+- UI 是设计文档的 phase 3，本包不含。
+
+## 第二阶段：reasoning 折叠
+
+助手思考过程是窗口里第二贵的东西。两个决定性实测事实决定了做法：
+
+1. **只有 tool-call 回合的 reasoning 会真的重发。** DeepSeek adapter 的 `serializeAssistant`
+   只在消息同时带 tool_calls 时才写 `reasoning_content`（普通回合的 reasoning 被主动丢弃）。
+   所以普通回合的 reasoning 折叠**收益为零**，直接跳过。实测三份真实会话：
+   tool-call 回合的 reasoning 占 surface 的 12–19%，普通回合只占 0.03–2.7%。
+2. **`assistant/message` 根本不能做 surface 替换。** 宿主强制替换必须引用所有被遮蔽节点，
+   但 assistant 消息「embeds its source stream」不允许带 `sourceEventSeqs`。
+   所以 phase 1 的替换协议在这里结构上不可用。
+
+替代方案是宿主官方给的**消息投影**（`ctx.sessions.registerMessageProjection`，
+`dsh-compaction-image-offload` 用它处理图片）：
+
+- 追加一条持久决策事件 `context-fold/reasoning`，指明折哪个节点的几个 reasoning 块；
+- 注册一个纯函数投影，在 `deriveMessages()`（也就是组请求的消息来源）时把 reasoning
+  换成 `240 字原文开头 + 省略说明`；
+- **日志一个字节不改**，原文永远在 append-only 事件里，块数量与块类型保持不变，
+  所以 replay 校验依然成立。
+
+规则：`MIN_REASONING_CHARS = 1200`（低于它标记本身比正文还长）、保留原文开头 240 字
+（不发明任何内容，开头是原文的真前缀）、沿用 phase 1 的年龄与「最近 N 步不动」规则、
+带标记的块永不二次折叠。
+
+投影对**过期目标宽容**：compaction 可能遮蔽决策点名的节点，此时抛错会让之后每一次
+`deriveMessages()` 都失败、把会话彻底弄死；所以过期目标跳过而非报错。决策本身形状
+非法（空 `targets`）仍然直接抛错，坏日志不会静默少折。
+
+投影**即使 `foldReasoning: false` 也注册**：决策事件是持久的，日志里已有决策的会话
+若没有对应投影会拒绝继续派生。开关只停止产生**新**决策，不能让旧日志读不出来。
+
+**已知缺口**：phase 2 不写 spill 文件。原文可从日志恢复，但没有「一跳可达」的
+`read`/`grep` 路径，链式召回对 reasoning 尚未成立（设计文档 §12.7）。
 
 ## 开发
 
