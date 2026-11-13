@@ -27,6 +27,7 @@ import { Config, resolveConfig, type ContextFoldConfig } from './config.ts'
 import { renderReport, reportOf } from './measure.ts'
 import type { FoldBatch } from './plan.ts'
 import { planReasoningFolds, reasoningCandidates, reasoningProjection, recordReasoningFolds } from './reasoning.ts'
+import { registerRoutes, type ConnectionRoutes } from './routes.ts'
 import { foldBatch, planFor, type FoldPassResult } from './session.ts'
 
 export { Config, resolveConfig, DEFAULT_CONFIG } from './config.ts'
@@ -131,7 +132,10 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
       // dependency on the tool-fold decision.
       if (reasoningPlans.length > 0) {
         try {
-          recordReasoningFolds(session, reasoningPlans)
+          // Spill the originals so the folded marker carries a real recovery
+          // path; without it the model is told detail is missing and given no
+          // way to fetch it (design §12.7).
+          await recordReasoningFolds(session, reasoningPlans, spillStore)
           const chars = reasoningPlans.reduce((total, plan) => total + plan.charsRemoved, 0)
           ctx.logger.info(`context-fold: folded reasoning in ${reasoningPlans.length} message(s), removed ${chars} chars`)
         } catch (error) {
@@ -212,6 +216,26 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
       // so warn instead of throwing out of `apply()`.
       ctx.logger.warn(`context-fold: reasoning projection not registered: ${error instanceof Error ? error.message : String(error)}`)
     }
+  })
+
+  // The conversation tab reads its data from these read-only routes: fold
+  // decisions are durable plugin records and originals live in the log, neither
+  // reachable from the browser.
+  ctx.inject(['connection'], (scope) => {
+    const connection = (scope as unknown as { connection?: ConnectionRoutes }).connection
+    if (connection === undefined) {
+      ctx.logger.warn('context-fold: no ctx.connection service; the conversation tab has no data source')
+      return
+    }
+    const tokenMeter = ctx.get('tokenMeter') as TokenMeter | undefined
+    registerRoutes(connection, {
+      sessionOf: (id) => {
+        const sessions = ctx.get('sessions') as { get(id: string): Session | undefined } | undefined
+        return sessions?.get(id)
+      },
+      estimateMessage: (message) => (tokenMeter === undefined ? 0 : tokenMeter.estimateMessage(message)),
+      ...(ctx.get('spillStore') === undefined ? {} : { spillStore: ctx.get('spillStore') as SpillStore }),
+    })
   })
 
   ctx.on('session/disposed', (session) => {

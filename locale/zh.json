@@ -1,6 +1,9 @@
 {
   "meta": {
     "title": "上下文折叠 (dsh-context-fold)",
-    "description": "阶段边界的 tool 结果折叠：结论留在窗口里，正文落到 spill 文件，用 /context-fold 报告折叠量与被重读次数。"
+    "description": "阶段边界的 tool 结果与历史 reasoning 折叠：结论留在窗口里，正文落到 spill 文件，用 /context-fold 报告折叠量与被重读次数。"
+  },
+  "tab": {
+    "contextFold": "上下文折叠"
   }
 }

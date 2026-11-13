@@ -430,7 +430,7 @@ Deliberately **not** in phase 1. The numbers can be computed from the session lo
 
 **Phase 2:** reasoning folding. **Mechanism resolved and implemented** — see §12. The original blocker (replay-state rewriting) was based on a wrong assumption about the seam: `assistant/message` cannot be surface-replaced at all, but a registered **message projection** folds its content without touching the log.
 
-**Phase 3:** UI in `dsh-context`'s form.
+**Phase 3:** UI in `dsh-context`'s form. **Done as an in-conversation tab** — see §13.
 
 **Phase 4 (user's second priority):** cross-session recall. Only after 1–3, and only if it is not better served by `dsh-recall`.
 
@@ -510,17 +510,53 @@ The projection is registered **even when `foldReasoning: false`**, because the f
 
 The host permits exactly one definition per event type, and `apply()` can run twice (a reload, or two config rows naming the same package). A duplicate registration is caught and warned about rather than thrown out of `apply()`: the first registration is already live and correct.
 
-### 12.7 Open gap: folded reasoning has no retrieval path
+### 12.7 Resolved: folded reasoning now has a retrieval path
 
-Phase 2 writes no spill file. That is worse than it first looks, and the earlier wording here ("a gap, not a bug: no conclusion is lost") understated it.
+Phase 2's first cut wrote no spill file, which was worse than it looked: the marker said `[… N chars of earlier reasoning omitted]` and offered **no way to fetch it** — a pointer to nothing. That invites the model to believe the detail is recoverable when it is not.
 
-The head is kept, so a conclusion survives — but the message trail says `[… N chars of earlier reasoning omitted]` and offers **no recovery path**. That is a pointer to nothing. Phase 1's promise is "conclusions inline, details one hop away": the model can call `read`/`grep` on the locator. Phase 2 delivers "conclusions inline, details unreachable" — the only copy is the raw `assistant/message` event, which no tool exposes.
+Now `recordReasoningFolds` spills each folded block's **original** text (not the folded summary) and records the locator on the durable decision, parallel to the block indexes. The projection re-inlines the same path on replay, so a restored session keeps the recovery path:
 
-Why this is worse than phase 1's tradeoff: it *invites* the model to believe the detail is recoverable. A model that was reasoning its way through a subtle problem cannot go back and re-read how far it got, and cannot know it cannot.
+```
+[context-fold] [reasoning] 9,000 chars folded.
+<240-char head>
+[… 8,760 chars of earlier reasoning omitted] Full text: /spill/…/reasoning-12-0.txt — use read (offset/limit) or grep on that path.
+```
 
-The fix is to spill the original reasoning text at fold time and inline the locator in the same marker, exactly as phase 1 does, so both kinds of fold share one recall chain. That is the next piece of work; it is recorded here rather than quietly dropped.
+A failed spill does not block the fold (phase 1's rule for tool results): the omission note stays accurate, only the hint is missing.
 
-**Also still open:** the interaction with `compaction-basic`. A compaction span covering an assistant node changes its surface seq, so a reasoning target pointing at the old seq goes stale and is skipped. Intended (see 12.6), but untested against a real `/compact`.
+**Still open:** the interaction with `compaction-basic`. A compaction span covering an assistant node changes its surface seq, so a reasoning target pointing at the old seq goes stale and is skipped. Intended (see 12.6), but untested against a real `/compact`.
+
+---
+
+## 13. Token accounting and the conversation tab
+
+### 13.1 The measurement that changed the plan
+
+Probing four real session logs found **zero `usage` fields on 972 `assistant/message` events**. So token and cache data does not live on the session log's message events; it is produced by `dsh-token-meter`'s `tokenUsage` projection. Any UI built on the log alone would have had no numbers.
+
+### 13.2 A true A/B is impossible — so the number is an estimate, and says so
+
+The "before" session never ran with folding disabled, and it will not be re-run. `src/counterfactual.ts` therefore **replays the token arithmetic** rather than measuring a difference, and labels itself an estimate everywhere it surfaces.
+
+Two corrections it encodes, both of which a naive estimate gets wrong:
+
+1. **Saved tokens would have been re-sent at the *cached* rate.** On a warm session the observed cache-read share is ~95%, and a cache read costs ~0.1× — so the real saving is roughly an order of magnitude below a naive `tokens × steps` count.
+2. **A fold invalidates the prefix from the first shadowed token**, re-billing the rest of the prompt at the uncached rate once. So folding has a one-time cost, and a fold that lands too late is a **net loss**. The module models both and can report a negative net.
+
+The tab states whether the session reported real provider usage at all — because a figure built on heuristics must not look like a bill — and lists the assumptions it depends on.
+
+### 13.3 UI form: `conversation.view`
+
+The user chose a single in-conversation tab over the full sidebar + page shape. It registers through the same seam `dsh-context` uses:
+
+```js
+ctx.slots.inject('conversation.view', () =>
+  ctx.slots.register({ name: 'conversation.view', id: 'context-fold', order: 40, label }, render))
+```
+
+`order: 40` puts it after `dsh-context`'s fleet tab (30). The tab renders what `/api/context-fold/report` returns and derives nothing itself: fold decisions are durable plugin records and originals live in the log, neither reachable from the browser. The original text of each fold is fetched lazily from `/api/context-fold/original` on expand — the point of folding is that this text is expensive, so it must not be loaded eagerly.
+
+The tab is deliberately plain DOM rather than importing React: the render prop may be called from any client runtime, and depending on one shell's React bundle would couple this package to a shell version.
 
 ---
 

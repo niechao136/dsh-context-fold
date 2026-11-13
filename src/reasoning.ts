@@ -34,6 +34,7 @@
 import type { AssistantMessage, ContentBlock, Message } from '@deepseek-ai/dsh-llm'
 import { appendPluginRecord, pluginRecordOf, type Session, type SessionEvent, type SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionMessageProjection, SessionMessageProjectionContext } from '@deepseek-ai/dsh-session/surface'
+import type { SpillStore } from '@deepseek-ai/dsh-spill'
 import type { ContextFoldConfig } from './config.ts'
 import { FOLD_MARKER } from './format.ts'
 import { codePointLength } from './rules.ts'
@@ -52,6 +53,8 @@ export interface ReasoningTarget {
   indexes: readonly number[]
   /** Original code-point length of each folded block, for the report. */
   chars: readonly number[]
+  /** Spill locator per folded block, parallel to `indexes`. Absent when spilling failed. */
+  locators?: readonly (string | undefined)[]
 }
 
 /** Data of one `plugin:context-fold/reasoning` decision record. */
@@ -157,18 +160,28 @@ export function isToolCallTurn(content: readonly ContentBlock[]): boolean {
  * the full-length note make the omission visible, which is the difference
  * between a cautious model and a fluent one.
  *
+ * When a `locator` is supplied the folded text inlines it, so the omission is
+ * **recoverable**: `read`/`grep` on that path returns the original reasoning.
+ * Without it the note is a pointer to nothing — it tells the model detail is
+ * missing while offering no way to fetch it — which is why the fold path always
+ * tries to spill first (design §12.7).
+ *
  * @param text - original reasoning text.
+ * @param locator - spill path holding the full original, when one was written.
  * @returns folded text, or undefined when folding would not shorten it.
  */
-export function foldReasoningText(text: string): string | undefined {
+export function foldReasoningText(text: string, locator?: string): string | undefined {
   if (isFoldedReasoning(text)) return undefined
   const chars = codePointLength(text)
   if (chars < MIN_REASONING_CHARS) return undefined
   const head = Array.from(text).slice(0, HEAD_CHARS).join('').trimEnd()
+  const omitted = `[… ${formatNumber(chars - codePointLength(head))} chars of earlier reasoning omitted]`
   const folded = [
     `${REASONING_MARKER} ${formatNumber(chars)} chars folded.`,
     head,
-    `[… ${formatNumber(chars - codePointLength(head))} chars of earlier reasoning omitted]`,
+    // The recovery hint must name the path and the tool, or the model has to
+    // guess both.
+    locator === undefined ? omitted : `${omitted} Full text: ${locator} — use read (offset/limit) or grep on that path.`,
   ].join('\n')
   return codePointLength(folded) < chars ? folded : undefined
 }
@@ -200,6 +213,14 @@ export interface ReasoningPlan {
   chars: readonly number[]
   /** Total characters removed. */
   charsRemoved: number
+  /**
+   * Spill locators parallel to `indexes`: where each block's full original lives.
+   *
+   * The record carries these so the projection can inline the same recovery path
+   * on replay; without them a restored session would show an omission note with
+   * no way to recover the text.
+   */
+  locators?: readonly (string | undefined)[]
 }
 
 /**
@@ -208,6 +229,10 @@ export interface ReasoningPlan {
  * A node qualifies when it is a tool-call turn (where reasoning is re-sent most,
  * and where the measurable win is), when it is old enough by the same age rules
  * phase 1 uses, and when at least one reasoning block is large enough to shrink.
+ *
+ * The plan itself does not spill: writing to the store is side-effectful, so it
+ * happens in `recordReasoningFolds`, which fills in the locators and re-derives
+ * the conclusion text with them.
  *
  * @param candidates - current assistant nodes, in surface order.
  * @param currentTurn - turn being evaluated.
@@ -259,11 +284,12 @@ export function planReasoningFolds(
  * @returns an immutable projected copy.
  * @throws when an index is out of range or does not name a reasoning block.
  */
-export function projectReasoning(message: AssistantMessage, indexes: readonly number[]): AssistantMessage {
+export function projectReasoning(message: AssistantMessage, indexes: readonly number[], locators?: readonly (string | undefined)[]): AssistantMessage {
   const content = message.content.map((block, index) => {
     if (!indexes.includes(index)) return block
     if (block.type !== 'reasoning') throw new Error(`context-fold: block ${index} is not reasoning`)
-    const folded = foldReasoningText(block.text)
+    const locator = locators?.[indexes.indexOf(index)]
+    const folded = foldReasoningText(block.text, locator)
     if (folded === undefined) throw new Error(`context-fold: block ${index} cannot be folded again`)
     return { ...block, text: folded }
   })
@@ -310,11 +336,72 @@ export function reasoningCandidates(session: Session): ReasoningCandidate[] {
  *
  * @param session - session to extend.
  * @param plans - folds to record.
+ * @param spill - optional spill store; when supplied, every folded block's full
+ *   text is written first and its locator is recorded so the projection can
+ *   inline a real recovery path.
  * @returns the record's sequence number.
  */
-export function recordReasoningFolds(session: Session, plans: readonly ReasoningPlan[]): SessionSeq {
-  const targets: ReasoningTarget[] = plans.map((plan) => ({ seq: plan.seq, indexes: [...plan.indexes], chars: [...plan.chars] }))
+export async function recordReasoningFolds(
+  session: Session,
+  plans: readonly ReasoningPlan[],
+  spill?: ReasoningSpill,
+): Promise<SessionSeq> {
+  const targets: ReasoningTarget[] = []
+  for (const plan of plans) {
+    const locators: (string | undefined)[] = []
+    const event = session.eventAt(plan.seq)
+    const message = event === undefined ? null : session.deriveEventMessage(event)
+    for (const [position, index] of plan.indexes.entries()) {
+      const block = message !== null && message.role === 'assistant' ? message.content[index] : undefined
+      // Spill the *original* text, not the folded text, or the recovery path
+      // would hand back the very summary it is supposed to expand.
+      const original = block !== undefined && block.type === 'reasoning' ? block.text : undefined
+      if (spill === undefined || original === undefined) {
+        locators.push(undefined)
+        continue
+      }
+      try {
+        const saved = await spill.saveText({
+          owner: { sessionId: session.header.id },
+          source: {
+            kind: 'tool',
+            toolName: 'reasoning',
+            // Reasoning has no model-issued call id; a stable synthetic one keeps
+            // the spill source shape valid and makes the file name traceable back
+            // to the node and block it came from.
+            callId: `reasoning-${String(plan.seq)}-${String(index)}` as never,
+            label: 'reasoning',
+          },
+          suggestedName: `reasoning-${String(plan.seq)}-${String(index)}.txt`,
+          content: original,
+        })
+        locators.push(saved.locator)
+      } catch {
+        // A failed spill must not block the fold: the omission note stays
+        // accurate, only the recovery hint is missing. Phase 1 makes the same
+        // choice for tool results.
+        locators.push(undefined)
+      }
+    }
+    targets.push({
+      seq: plan.seq,
+      indexes: [...plan.indexes],
+      chars: [...plan.chars],
+      ...(locators.some((locator) => locator !== undefined) ? { locators } : {}),
+    })
+  }
   return appendPluginRecord(session, REASONING_EVENT, { targets })
+}
+
+/**
+ * The slice of the spill store this module needs.
+ *
+ * Typed against the host's own `SpillStore` rather than a hand-written shape:
+ * its ids are branded (`SessionId`, `ToolCallId`), so a local structural type
+ * would either fail to accept the real store or force a cast.
+ */
+export type ReasoningSpill = {
+  saveText(input: SpillStore['saveText'] extends (input: infer I) => Promise<unknown> ? I : never): Promise<{ locator: string }>
 }
 
 /**
@@ -411,15 +498,17 @@ export const reasoningProjection = {
       // block. The record is authoritative about *which* blocks, so this never
       // depends on positional re-derivation.
       const indexes: number[] = []
-      for (const index of target.indexes) {
+      const locators: (string | undefined)[] = []
+      for (const [position, index] of target.indexes.entries()) {
         const block = message.content[index]
         if (block === undefined || block.type !== 'reasoning') continue
         if (isFoldedReasoning(block.text)) continue
         if (foldReasoningText(block.text) === undefined) continue
         indexes.push(index)
+        locators.push(target.locators?.[position])
       }
       if (indexes.length === 0) continue
-      updates.set(target.seq, projectReasoning(message, indexes))
+      updates.set(target.seq, projectReasoning(message, indexes, locators))
     }
     return updates
   },
