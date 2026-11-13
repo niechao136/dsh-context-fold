@@ -3,3 +3,6 @@ lib/
 coverage/
 *.log
 .tmp-*/
+
+# Local release credentials — never commit
+token.txt
