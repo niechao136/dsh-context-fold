@@ -30,6 +30,7 @@
  *
  * @module dsh-context-fold/client
  */
+import { ensurePanelCss } from './panel-css.ts'
 
 /** One fold row as the server reports it. */
 export interface FoldRow {
@@ -124,16 +125,7 @@ const en: Record<string, string> = {
 
 const react = require('react') as ReactFace
 
-/**
- * Fetch the report for one session.
- *
- * Failures are reported rather than swallowed: before the routes existed the
- * tab rendered "no report available", which reads like "this session folded
- * nothing" instead of "the request never landed".
- *
- * @param sessionId - session to report on.
- * @returns the payload, or a message describing why there is none.
- */
+/** Fetch the report for one session. */
 async function fetchReport(sessionId: string): Promise<{ report: FoldReportPayload } | { error: string }> {
   // Absolute: these are the exact paths the server registers on the connection
   // route registry, and the shell serves the GUI from the origin root.
@@ -171,15 +163,22 @@ async function fetchOriginal(sessionId: string, locator: string): Promise<string
   return body.ok === true ? body.value?.text : undefined
 }
 
-/** Format a number for display. */
+/** Format a number with thousands separators and at most one decimal. */
 function num(value: number): string {
   return value.toLocaleString('en-US', { maximumFractionDigits: 1 })
 }
 
-/** A signed figure with an explicit sign, so a loss never looks like a gain. */
+/** A signed figure with an explicit sign, so a loss never reads as a gain. */
 function signed(value: number): string {
   const rounded = Math.round(value * 10) / 10
   return `${rounded > 0 ? '+' : ''}${num(rounded)}`
+}
+
+/** Compact token count: 1.2M rather than 1200000. */
+function compact(value: number): string {
+  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`
+  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(1)}K`
+  return num(value)
 }
 
 /** Cached per-session report, so re-renders do not refetch on every paint. */
@@ -198,95 +197,122 @@ function sessionIdOf(props: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
 }
 
-/** Inline styles, kept as plain objects because no CSS module ships here. */
-const styles = {
-  root: { padding: '12px', font: '13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace', overflow: 'auto', height: '100%' },
-  title: { fontWeight: 600, marginBottom: '8px' },
-  muted: { color: '#888' },
-  box: { marginBottom: '12px', padding: '8px', border: '1px solid #333', borderRadius: '6px' },
-  heading: { fontWeight: 600, marginBottom: '6px' },
-  table: { borderCollapse: 'collapse' as const },
-  labelCell: { padding: '1px 12px 1px 0', color: '#aaa' },
-  warning: { marginTop: '6px', color: '#facc15' },
-  error: { marginTop: '6px', color: '#f87171' },
-  reread: { marginTop: '6px', color: '#f87171' },
-  fold: { marginBottom: '6px', padding: '6px', border: '1px solid #2a2a2a', borderRadius: '6px' },
-  foldSummary: { cursor: 'pointer' },
-  inlinePre: { whiteSpace: 'pre-wrap' as const, margin: '6px 0', color: '#bbb', maxHeight: '12em', overflow: 'auto' },
-  originalPre: {
-    whiteSpace: 'pre-wrap' as const,
-    margin: '6px 0',
-    color: '#ddd',
-    maxHeight: '24em',
-    overflow: 'auto',
-    borderTop: '1px dashed #333',
-    paddingTop: '6px',
-  },
-  locator: { color: '#666', fontSize: '11px', wordBreak: 'break-all' as const },
-  notRecoverable: { color: '#f87171', fontSize: '11px' },
-  detailsToggle: { cursor: 'pointer', color: '#888', marginTop: '6px' },
-  assumptionList: { margin: '4px 0 0 16px', padding: 0, color: '#999' },
+const el = react.createElement
+
+/** One labelled metric tile. */
+function Metric(props: { label: string; value: string; sub?: string; tone?: 'good' | 'bad' | 'warn' }): unknown {
+  const toneClass = props.tone === undefined ? '' : ` cf-${props.tone}`
+  const children: unknown[] = [
+    el('div', { className: 'cf-metric-label', key: 'l' }, props.label),
+    el('div', { className: `cf-metric-value${toneClass}`, key: 'v' }, props.value),
+  ]
+  if (props.sub !== undefined) children.push(el('div', { className: 'cf-metric-sub', key: 's' }, props.sub))
+  return el('div', { className: 'cf-metric' }, ...children)
 }
 
-/** The counterfactual summary block. */
+/** A notice strip, optionally warning-toned. */
+function Notice(props: { children: unknown; warn?: boolean }): unknown {
+  return el('div', { className: props.warn === true ? 'cf-notice cf-notice-warn' : 'cf-notice' }, props.children)
+}
+
+/** The counterfactual summary card. */
 function Summary(props: { report: FoldReportPayload }): unknown {
   const cf = props.report.counterfactual
-  const rows: [string, string][] = [
-    ['Folded content, now', `${num(cf.tokensNow)} tokens`],
-    ['If it had stayed unfolded', `${num(cf.tokensIfUnfolded)} tokens`],
-    ['Prompt reduction per step', `${num(cf.tokensSavedPerStep)} tokens`],
-    ['Steps still paying the folded prompt', num(cf.remainingSteps)],
-    ['Gross saving', signed(cf.grossSaving)],
-    ['Prefix invalidation cost', signed(-cf.invalidationCost)],
-    ['Net', signed(cf.netSaving)],
-  ]
-  return react.createElement(
+  const savedChars = props.report.folds.reduce((total, fold) => total + (fold.charsBefore - fold.charsAfter), 0)
+  const netTone = cf.netSaving >= 0 ? 'good' : 'bad'
+
+  return el(
     'section',
-    { style: styles.box },
-    react.createElement('div', { style: styles.heading, key: 'h' }, 'Token comparison (estimate)'),
-    react.createElement(
-      'table',
-      { style: styles.table, key: 't' },
-      ...rows.map(([label, value]) =>
-        react.createElement(
-          'tr',
-          { key: label },
-          react.createElement('td', { style: styles.labelCell }, label),
-          react.createElement(
-            'td',
-            // A negative net must read as a loss at a glance.
-            label === 'Net'
-              ? { style: { fontWeight: 600, color: cf.netSaving >= 0 ? '#4ade80' : '#f87171' } }
-              : null,
-            value,
-          ),
+    { className: 'cf-card' },
+    el('div', { className: 'cf-card-title', key: 'h' }, 'Token comparison'),
+    el(
+      'div',
+      { className: 'cf-grid', key: 'g' },
+      el(Metric, {
+        key: 'now',
+        label: 'Folded content now',
+        value: `${compact(cf.tokensNow)} tok`,
+        sub: 'what the window carries',
+      }),
+      el(Metric, {
+        key: 'before',
+        label: 'If never folded',
+        value: `${compact(cf.tokensIfUnfolded)} tok`,
+        sub: 'counterfactual',
+      }),
+      el(Metric, {
+        key: 'per',
+        label: 'Saving per step',
+        value: `${num(cf.tokensSavedPerStep)} tok`,
+        sub: `${num(cf.remainingSteps)} steps left`,
+      }),
+      el(Metric, {
+        key: 'gross',
+        label: 'Gross saving',
+        value: signed(cf.grossSaving),
+        sub: 'before invalidation',
+        tone: cf.grossSaving >= 0 ? 'good' : 'bad',
+      }),
+      el(Metric, {
+        key: 'cost',
+        label: 'Invalidation cost',
+        value: signed(-cf.invalidationCost),
+        sub: 'one-off prefix re-charge',
+        tone: 'warn',
+      }),
+      el(Metric, {
+        key: 'net',
+        label: 'Net',
+        value: signed(cf.netSaving),
+        sub: cf.netSaving >= 0 ? 'net win' : 'net loss — folded too late',
+        tone: netTone,
+      }),
+    ),
+    el(
+      'div',
+      { style: { marginTop: '12px' }, key: 'n' },
+      el(
+        Notice,
+        {
+          warn: !cf.hasRealUsage,
+        },
+        el(
+          'span',
+          null,
+          cf.hasRealUsage
+            ? el(
+                'span',
+                null,
+                el('span', { className: 'cf-notice-strong' }, 'Priced against real usage. '),
+                `Cache-read share ${cf.cacheReadShare === undefined ? 'n/a' : `${(cf.cacheReadShare * 100).toFixed(1)}%`}.`,
+              )
+            : el(
+                'span',
+                null,
+                el('span', { className: 'cf-notice-strong' }, 'Heuristic only. '),
+                'This session reported no provider usage, so these are token counts — not a bill.',
+              ),
         ),
       ),
     ),
-    react.createElement(
+    el(
       'div',
-      { style: styles.warning, key: 'f' },
-      cf.hasRealUsage
-        ? `Priced against this session's real usage${cf.cacheReadShare === undefined ? '' : ` (cache-read share ${(cf.cacheReadShare * 100).toFixed(1)}%)`}.`
-        : 'This session reported NO provider usage — every figure here is heuristic token counts, not a bill.',
-    ),
-    react.createElement(
-      'details',
-      { key: 'a' },
-      react.createElement('summary', { style: styles.detailsToggle }, 'Assumptions'),
-      react.createElement(
-        'ul',
-        { style: styles.assumptionList },
-        ...cf.assumptions.map((assumption, index) => react.createElement('li', { key: String(index) }, assumption)),
-      ),
+      { className: 'cf-aside', style: { marginTop: '10px' }, key: 'a' },
+      `${num(savedChars)} characters removed across ${String(props.report.folds.length)} fold(s).`,
     ),
     props.report.reReads > 0
-      ? react.createElement(
+      ? el(
           'div',
-          { style: styles.reread, key: 'r' },
-          `Re-read signals: ${String(props.report.reReads)} — folded content was fetched again after being folded.`,
+          { className: 'cf-notice cf-notice-warn', style: { marginTop: '10px' }, key: 'r' },
+          el(
+            'span',
+            null,
+            el('span', { className: 'cf-notice-strong' }, `${String(props.report.reReads)} re-read signal(s). `),
+            'Folded content was fetched again after being folded — folding it may have cost more than it saved.',
+          ),
         )
       : null,
+    el('details', { key: 'asm', style: { marginTop: '10px' } }, el('summary', { className: 'cf-aside' }, 'Assumptions'), el('ul', { style: { margin: '6px 0 0 18px', padding: 0 }, }, ...cf.assumptions.map((assumption, index) => el('li', { className: 'cf-aside', key: String(index) }, assumption)))),
   )
 }
 
@@ -307,52 +333,67 @@ function FoldItem(props: { sessionId: string; fold: FoldRow }): unknown {
     })
   }
 
-  const label = fold.kind === 'reasoning' ? 'reasoning' : (fold.toolName ?? 'tool')
-  const summary = `${label} · turn ${String(fold.turn)}.${String(fold.step)} · ${num(fold.charsBefore)} → ${num(fold.charsAfter)} chars · ${fold.recoverable ? 'recoverable' : 'NOT recoverable'}`
+  const isReasoning = fold.kind === 'reasoning'
+  const tagClass = isReasoning ? 'cf-tag cf-tag-reasoning' : 'cf-tag'
+  const saved = fold.tokensBefore - fold.tokensAfter
+
+  const body: unknown[] = [
+    el('div', { className: 'cf-fold-body', key: 'b' },
+      el('div', { className: 'cf-label' }, 'What stays in the window'),
+      el('pre', { className: 'cf-pre' }, fold.inline),
+      fold.locator !== undefined
+        ? el('div', null,
+            el('div', { className: 'cf-label' }, 'Full original'),
+            original === null
+              ? el('div', { className: 'cf-aside' }, 'Expand to load from the recovery path.')
+              : el('pre', { className: 'cf-pre cf-pre-original' }, original),
+            el('div', { className: 'cf-locator' }, fold.locator),
+          )
+        : el('div', { className: 'cf-aside cf-bad', style: { marginTop: '8px' } },
+            'No recovery path: the original is in the session log but no tool exposes it.'),
+    ),
+  ]
 
   const children: unknown[] = [
-    react.createElement('summary', { style: styles.foldSummary, key: 's' }, summary),
-    react.createElement('pre', { style: styles.inlinePre, key: 'i' }, fold.inline),
+    el('summary', { className: 'cf-fold-head', key: 'h' },
+      el('span', { className: 'cf-caret' }, '▶'),
+      el('span', { className: tagClass }, isReasoning ? 'reasoning' : (fold.toolName ?? 'tool')),
+      el('span', { className: 'cf-fold-pos' }, `turn ${String(fold.turn)}.${String(fold.step)}`),
+      el('span', { className: 'cf-fold-pos' }, `${compact(fold.charsBefore)} → ${compact(fold.charsAfter)} chars`),
+      el('span', { className: 'cf-fold-saving' }, `−${compact(Math.max(0, saved))} tok`),
+    ),
   ]
-  if (fold.locator !== undefined) {
-    children.push(react.createElement('div', { style: styles.locator, key: 'l' }, fold.locator))
-    if (original !== null) {
-      children.push(react.createElement('pre', { style: styles.originalPre, key: 'o' }, original))
-    }
-  } else if (!fold.recoverable) {
-    children.push(
-      react.createElement(
+  children.push(...body)
+
+  return el('details', { className: 'cf-fold', onToggle }, ...children)
+}
+
+/** The per-fold list card. */
+function FoldList(props: { sessionId: string; report: FoldReportPayload }): unknown {
+  const { report, sessionId } = props
+  const title = el('div', { className: 'cf-card-title', key: 'h' }, `Folded content · ${String(report.folds.length)}`)
+  if (report.folds.length === 0) {
+    return el(
+      'section',
+      { className: 'cf-card' },
+      title,
+      el(
         'div',
-        { style: styles.notRecoverable, key: 'w' },
-        'No recovery path: the original is in the session log but no tool exposes it.',
+        { className: 'cf-empty', key: 'e' },
+        el('div', { className: 'cf-empty-title' }, 'Nothing folded in this session yet'),
+        el('div', null, 'Folds appear once a step batch is old enough and large enough to be worth replacing.'),
       ),
     )
   }
-
-  return react.createElement('details', { style: styles.fold, onToggle }, ...children)
-}
-
-/** The per-fold list. */
-function FoldList(props: { sessionId: string; report: FoldReportPayload }): unknown {
-  const { report, sessionId } = props
-  const heading = react.createElement(
-    'div',
-    { style: styles.heading, key: 'h' },
-    `Folded content (${String(report.folds.length)})`,
-  )
-  if (report.folds.length === 0) {
-    return react.createElement(
-      'section',
-      null,
-      heading,
-      react.createElement('div', { style: styles.muted, key: 'e' }, 'Nothing has been folded in this session yet.'),
-    )
-  }
-  return react.createElement(
+  return el(
     'section',
-    null,
-    heading,
-    ...report.folds.map((fold) => react.createElement(FoldItem, { key: String(fold.seq), sessionId, fold })),
+    { className: 'cf-card' },
+    title,
+    el(
+      'div',
+      { className: 'cf-folds' },
+      ...report.folds.map((fold) => el(FoldItem, { key: String(fold.seq), sessionId, fold })),
+    ),
   )
 }
 
@@ -382,24 +423,44 @@ function ContextFoldTab(props: unknown): unknown {
     }
   }, [sessionId])
 
-  const children: unknown[] = [react.createElement('div', { style: styles.title, key: 'title' }, 'Context fold')]
+  const head = el('div', { className: 'cf-head', key: 'head' },
+    el('span', { className: 'cf-head-title' }, 'Context fold'),
+    sessionId === undefined
+      ? null
+      : el('span', { className: 'cf-head-note' }, state.status === 'ready'
+          ? `${String(state.report?.folds.length ?? 0)} fold(s) on the current surface`
+          : 'stage-boundary folding'),
+  )
+
+  const children: unknown[] = [head]
   if (sessionId === undefined) {
-    children.push(react.createElement('div', { style: styles.muted, key: 'm' }, 'No active session.'))
+    children.push(
+      el('div', { className: 'cf-card' },
+        el('div', { className: 'cf-empty' },
+          el('div', { className: 'cf-empty-title' }, 'No active session'),
+          el('div', null, 'Open a conversation to see its folds.'),
+        ),
+      ),
+    )
   } else if (state.status === 'loading') {
-    children.push(react.createElement('div', { style: styles.muted, key: 'm' }, 'Loading…'))
+    children.push(el('div', { className: 'cf-card' }, el('div', { className: 'cf-empty' }, 'Loading…')))
   } else if (state.status === 'error') {
     children.push(
-      react.createElement('div', { style: styles.error, key: 'e' }, `Could not load the report: ${state.error ?? 'unknown'}`),
+      el('div', { className: 'cf-card' },
+        el('div', { className: 'cf-empty' },
+          el('div', { className: 'cf-empty-title cf-bad' }, 'Could not load the report'),
+          el('div', null, state.error ?? 'unknown error'),
+        ),
+      ),
     )
   } else if (state.status !== 'ready' || state.report === undefined) {
-    children.push(
-      react.createElement('div', { style: styles.muted, key: 'm' }, 'This session has no folds to report.'),
-    )
+    children.push(el('div', { className: 'cf-card' }, el('div', { className: 'cf-empty' }, 'This session has no folds to report.')))
   } else {
-    children.push(react.createElement(Summary, { key: 'summary', report: state.report }))
-    children.push(react.createElement(FoldList, { key: 'folds', sessionId, report: state.report }))
+    children.push(el(Summary, { key: 'summary', report: state.report }))
+    children.push(el(FoldList, { key: 'folds', sessionId, report: state.report }))
   }
-  return react.createElement('div', { className: 'context-fold-tab', style: styles.root }, ...children)
+
+  return el('div', { className: 'cf-root' }, ...children)
 }
 
 /** Client plugin name. */
@@ -417,6 +478,8 @@ export const inject = ['slots', 'locale']
  * @param ctx - client plugin context.
  */
 export function apply(ctx: ClientContext): void {
+  ensurePanelCss()
+
   const registerDictionaries = (): void => {
     ctx.locale.register(NS, { zh, en })
   }
