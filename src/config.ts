@@ -50,49 +50,82 @@ export const DEFAULT_CONFIG: Readonly<ContextFoldConfig> = deepFreeze({
   dryRun: false,
 })
 
-/** Config schema shown in the settings UI. */
-export const Config = z.object({
-  minFoldChars: z
-    .number()
-    .step(1)
-    .min(300)
-    .default(DEFAULT_CONFIG.minFoldChars)
-    .description('Skip tool results smaller than this many characters. Never below 300.'),
-  minBatchChars: z
-    .number()
-    .step(1)
-    .min(1)
-    .default(DEFAULT_CONFIG.minBatchChars)
-    .description('Only fold a batch of candidates whose combined size reaches this many characters.'),
-  keepRecentSteps: z
-    .number()
-    .step(1)
-    .min(0)
-    .default(DEFAULT_CONFIG.keepRecentSteps)
-    .description('Never fold a result from the newest N steps.'),
-  staleSteps: z
-    .number()
-    .step(1)
-    .min(1)
-    .default(DEFAULT_CONFIG.staleSteps)
-    .description('Age (in steps) after which a result may fold inside one long turn.'),
-  batchSpanSteps: z
-    .number()
-    .step(1)
-    .min(1)
-    .default(DEFAULT_CONFIG.batchSpanSteps)
-    .description('Split a turn longer than this many steps into contiguous sub-batches.'),
-  foldReasoning: z
-    .boolean()
-    .default(DEFAULT_CONFIG.foldReasoning)
-    .description('Fold reasoning blocks on historical tool-call turns. Reasoning on plain turns is never re-sent, so it is not folded.'),
-  foldPlainTurnReasoning: z
-    .boolean()
-    .default(DEFAULT_CONFIG.foldPlainTurnReasoning)
-    .description('Also fold reasoning on plain turns. Enable when the route re-sends it (e.g. dsh-router-core); leave off for dsh-llm-deepseek, which drops it.'),
-  enabled: z.boolean().default(DEFAULT_CONFIG.enabled).description('Turn folding on or off.'),
-  dryRun: z.boolean().default(DEFAULT_CONFIG.dryRun).description('Compute and report candidates without mutating the session.'),
-})
+/**
+ * Config schema shown in the settings UI.
+ *
+ * Every field ends in `.volatile()`, and that is load-bearing rather than
+ * cosmetic: the Settings service builds a page from `volatileForm(schema)` and
+ * returns no page at all when the schema has no volatile field
+ * (`describe()` drops the entry outright). Without it the plugin simply has no
+ * configuration surface — the fields still work through the Cordis patch, but
+ * nothing is listed and nothing is editable in the GUI.
+ *
+ * Fields are also individually described, because the auto-generated page uses
+ * the description as the field's help text.
+ */
+export const Config = z
+  .object({
+    minFoldChars: z
+      .number()
+      .step(1)
+      .min(300)
+      .default(DEFAULT_CONFIG.minFoldChars)
+      .description('Skip tool results smaller than this many characters. Never below 300.')
+      .volatile(),
+    minBatchChars: z
+      .number()
+      .step(1)
+      .min(1)
+      .default(DEFAULT_CONFIG.minBatchChars)
+      .description('Only fold a batch of candidates whose combined size reaches this many characters.')
+      .volatile(),
+    keepRecentSteps: z
+      .number()
+      .step(1)
+      .min(0)
+      .default(DEFAULT_CONFIG.keepRecentSteps)
+      .description('Never fold a result from the newest N steps.')
+      .volatile(),
+    staleSteps: z
+      .number()
+      .step(1)
+      .min(1)
+      .default(DEFAULT_CONFIG.staleSteps)
+      .description('Age (in steps) after which a result may fold inside one long turn.')
+      .volatile(),
+    batchSpanSteps: z
+      .number()
+      .step(1)
+      .min(1)
+      .default(DEFAULT_CONFIG.batchSpanSteps)
+      .description('Split a turn longer than this many steps into contiguous sub-batches.')
+      .volatile(),
+    foldReasoning: z
+      .boolean()
+      .default(DEFAULT_CONFIG.foldReasoning)
+      .description(
+        'Fold reasoning blocks on historical tool-call turns. Reasoning on plain turns is never re-sent, so it is not folded.',
+      )
+      .volatile(),
+    foldPlainTurnReasoning: z
+      .boolean()
+      .default(DEFAULT_CONFIG.foldPlainTurnReasoning)
+      .description(
+        'Also fold reasoning on plain turns. Enable when the route re-sends it (e.g. dsh-router-core); leave off for dsh-llm-deepseek, which drops it.',
+      )
+      .volatile(),
+    enabled: z
+      .boolean()
+      .default(DEFAULT_CONFIG.enabled)
+      .description('Turn folding on or off.')
+      .volatile(),
+    dryRun: z
+      .boolean()
+      .default(DEFAULT_CONFIG.dryRun)
+      .description('Compute and report candidates without mutating the session.')
+      .volatile(),
+  })
+  .description('Stage-boundary folding of completed tool results and historical reasoning.')
 
 /**
  * Resolve and validate a partly-specified configuration.

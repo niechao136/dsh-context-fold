@@ -70,6 +70,40 @@ interface SessionState {
 }
 
 /**
+ * Give the plugin a page in the settings UI.
+ *
+ * The Settings service builds a page for every active plugin whose config schema
+ * exposes at least one `.volatile()` field (see `Config`), so this only has to
+ * declare the page policy. The policy names the plugin's own fiber as the owner,
+ * which is what stops a reload from stacking a second page.
+ *
+ * `configure` throws when called twice for the same fiber, so a duplicate is
+ * caught and reported rather than taking `apply()` down with it. Failing to get a
+ * page is not a reason to stop folding.
+ *
+ * @param ctx - plugin context.
+ */
+function declareSettingsPage(ctx: Context): void {
+  ctx.inject(['settings'], (scope) => {
+    const settings = (scope as unknown as { settings?: { configure(presentation: { auto?: boolean }): () => void } }).settings
+    if (settings === undefined || typeof settings.configure !== 'function') {
+      ctx.logger.warn('context-fold: no ctx.settings service; the configuration page is unavailable')
+      return
+    }
+    try {
+      // `auto: true` asks the host to render a page from the config schema.
+      const dispose = settings.configure({ auto: true })
+      if (typeof dispose === 'function') ctx.effect(() => dispose, 'context-fold: settings page')
+      ctx.logger.info('context-fold: configuration page registered')
+    } catch (error) {
+      ctx.logger.warn(
+        `context-fold: configuration page not registered: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  })
+}
+
+/**
  * Mount the fold policy.
  *
  * @param ctx - plugin context.
@@ -77,6 +111,13 @@ interface SessionState {
  */
 export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}): void {
   const config = resolveConfig(rawConfig)
+
+  // The settings page must exist even when folding is switched off — otherwise
+  // turning `enabled` back on would require editing the profile file by hand,
+  // which is precisely the situation the page exists to avoid. It is also the
+  // only way the other knobs are discoverable at all.
+  declareSettingsPage(ctx)
+
   if (!config.enabled) {
     ctx.logger.info('context-fold: disabled by configuration')
     return
