@@ -220,6 +220,46 @@ function valueOf(layer: Record<string, unknown> | undefined, key: string): unkno
 }
 
 /**
+ * Host operations, resolved once while the plugin's inject context is live.
+ *
+ * Reading `ctx.remote` during a render throws `cannot get property "remote"
+ * without inject`: a Cordis context only resolves its services inside the scope
+ * its `inject` was declared for, and a component body runs later, outside it. The
+ * official pages follow the same rule — they build their Host callbacks in
+ * `apply()` and inject the callbacks into the component, which never touches
+ * `ctx` itself.
+ *
+ * So this is captured at registration and passed down as plain functions.
+ */
+export interface SettingsOps {
+  /** Read the settings document. */
+  describe(): Promise<{ ok: boolean; value?: SettingsDocument; error?: { message?: string } }>
+  /** Apply one namespace mutation, guarded by a revision. */
+  mutate(
+    ns: string,
+    ops: readonly { op: 'set' | 'unset'; path: string[]; value?: unknown }[],
+    revision: number,
+  ): Promise<{ ok: boolean; value?: unknown; error?: { message?: string } }>
+}
+
+/**
+ * Resolve the settings operations from a live context.
+ *
+ * @param ctx - the plugin context, whose `inject` must include `remote.settings`.
+ * @returns the operations, or undefined when the remote is absent.
+ */
+export function settingsOpsOf(ctx: { remote?: { settings?: SettingsOps } }): SettingsOps | undefined {
+  const settings = ctx.remote?.settings
+  if (settings === undefined) return undefined
+  // Bind so the returned functions keep working after the render pass; the
+  // methods are captured here, not looked up later.
+  return {
+    describe: () => settings.describe(),
+    mutate: (ns, ops, revision) => settings.mutate(ns, ops, revision),
+  }
+}
+
+/**
  * Build the settings page registration.
  *
  * The slot expects a **React component**, not a rendered element: the host mounts
@@ -232,9 +272,12 @@ function valueOf(layer: Record<string, unknown> | undefined, key: string): unkno
  * @returns the slot disposer, when the host returns one.
  */
 export function registerSettingsPage(ctx: SettingsPageContext): unknown {
-  // The component is module-scoped (so the host sees a stable reference), which
-  // means it cannot close over `ctx`; stash it here for the render pass.
-  pageContext = ctx
+  // Resolve every Cordis service touch here, while this `apply` scope is still
+  // live. The component below must never read `ctx` itself: its body runs during
+  // render, outside the inject scope, where `ctx.remote` throws.
+  const ops = settingsOpsOf(ctx)
+  const label = (key: string): string => translate(ctx, key)
+
   return ctx.slots.inject('settings.section', () =>
     ctx.slots.register(
       {
@@ -243,47 +286,43 @@ export function registerSettingsPage(ctx: SettingsPageContext): unknown {
         // After the built-in sections (general 0, plugins 15).
         order: 60,
         locale: SETTINGS_NS,
-        label: () => translate(ctx, 'settings.nav'),
+        label: () => label('settings.nav'),
+        // The official pages pass their Host operations through `inject`; the
+        // component receives them as props instead of resolving services.
+        inject: () => ({ ops }),
       },
       SettingsSection,
     ),
   )
 }
 
-/** The context captured for the module-scoped section component. */
-let pageContext: SettingsPageContext | undefined
-
 /**
  * The section component.
  *
- * Declared at module scope and passed to `slots.register` as a stable component
- * reference, so the host mounts it once per navigation rather than remounting a
- * fresh closure each render.
+ * Reads everything it needs from props: the slot `kit` (`t`), and the `ops`
+ * captured at registration. It never touches a Cordis context, which is why it
+ * survives being mounted after `apply()` has returned.
  *
- * @param props - slot props (carries the React runtime seat).
+ * @param props - slot props: `ops`, optional `react`, and the slot `kit`.
  * @returns the rendered section.
  */
 function SettingsSection(props: unknown): unknown {
-  const ctx = pageContext
-  // `pageContext` is assigned by `registerSettingsPage` before the host can mount
-  // this component, so this is only a defensive branch.
-  if (ctx === undefined) {
-    const react = reactOf(props)
-    return react.createElement('div', { className: 'cf-set' }, 'context-fold: settings context was released; reload the page.')
-  }
+  const { ops } = (props ?? {}) as { ops?: SettingsOps }
+  const text = (props ?? {}) as { t?: (key: string) => string }
+  // `t` comes from the slot kit because the entry declares a locale namespace.
+  const translateKey = typeof text.t === 'function' ? text.t : undefined
   try {
-    return renderPage(ctx, reactOf(props))
+    return renderPage(reactOf(props), ops, translateKey)
   } catch (error) {
     // The shell wraps every slot entry in an error boundary that renders an empty
     // anchor on failure, so a thrown error here shows as a blank section with no
-    // message anywhere. Render the failure instead: a visible reason is worth far
-    // more than a clean-looking page.
+    // message anywhere. Render the failure instead.
     const react = reactOf(props)
     const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
     return react.createElement(
       'div',
       { className: 'cf-set' },
-      react.createElement('div', { className: 'cf-set-title' }, translate(ctx, 'page.failed')),
+      react.createElement('div', { className: 'cf-set-title' }, 'Context fold — settings failed to render'),
       react.createElement('pre', { className: 'cf-set-crash' }, message),
     )
   }
@@ -335,7 +374,7 @@ interface PageState {
  * @param react - React seat.
  * @returns the page element.
  */
-function renderPage(ctx: SettingsPageContext, react: ReactSeat): unknown {
+function renderPage(react: ReactSeat, settings: SettingsOps | undefined, t?: (key: string) => string): unknown {
   const el = react.createElement
   const [state, setState] = react.useState<PageState>({
     status: 'loading',
@@ -343,8 +382,6 @@ function renderPage(ctx: SettingsPageContext, react: ReactSeat): unknown {
     writable: false,
     busy: false,
   })
-
-  const settings = ctx.remote?.settings
   const ns = namespaceOf()
 
   const load = (): void => {
@@ -425,28 +462,37 @@ function renderPage(ctx: SettingsPageContext, react: ReactSeat): unknown {
       })
   }
 
-  const t = (key: string): string => translate(ctx, key)
+  // Prefer the slot's translator (bound to this entry's locale namespace), then
+  // this module's own dictionary. No service lookup: the component must not read
+  // a Cordis context during render.
+  const tr = (key: string): string => {
+    if (t !== undefined) {
+      const translated = t(key)
+      if (typeof translated === 'string' && translated !== '' && translated !== key) return translated
+    }
+    return en[key] ?? zh[key] ?? key
+  }
 
   const header = el(
     'div',
     { className: 'cf-set-head', key: 'h' },
-    el('div', { className: 'cf-set-title' }, t('page.title')),
-    el('div', { className: 'cf-set-intro' }, t('page.intro')),
+    el('div', { className: 'cf-set-title' }, tr('page.title')),
+    el('div', { className: 'cf-set-intro' }, tr('page.intro')),
   )
 
   if (state.status === 'loading') {
-    return el('div', { className: 'cf-set' }, header, el('div', { className: 'cf-set-note' }, t('page.loading')))
+    return el('div', { className: 'cf-set' }, header, el('div', { className: 'cf-set-note' }, tr('page.loading')))
   }
   if (state.status === 'unavailable') {
-    return el('div', { className: 'cf-set' }, header, el('div', { className: 'cf-set-note' }, t('page.unavailable')))
+    return el('div', { className: 'cf-set' }, header, el('div', { className: 'cf-set-note' }, tr('page.unavailable')))
   }
   if (state.status === 'error') {
     return el(
       'div',
       { className: 'cf-set' },
       header,
-      el('div', { className: 'cf-set-note cf-bad' }, state.message ?? t('page.failed')),
-      el('button', { className: 'cf-set-btn', type: 'button', onClick: load }, t('page.reload')),
+      el('div', { className: 'cf-set-note cf-bad' }, state.message ?? tr('page.failed')),
+      el('button', { className: 'cf-set-btn', type: 'button', onClick: load }, tr('page.reload')),
     )
   }
 
@@ -496,17 +542,17 @@ function renderPage(ctx: SettingsPageContext, react: ReactSeat): unknown {
       : el(
           'div',
           { className: state.message === 'saved' ? 'cf-set-note cf-good' : 'cf-set-note cf-bad', key: 's' },
-          state.message === 'saved' ? t('page.saved') : state.message,
+          state.message === 'saved' ? tr('page.saved') : state.message,
         )
 
   return el(
     'div',
     { className: 'cf-set' },
     header,
-    !state.writable ? el('div', { className: 'cf-set-note cf-warn' }, t('page.readonly')) : null,
+    !state.writable ? el('div', { className: 'cf-set-note cf-warn' }, tr('page.readonly')) : null,
     el('div', { className: 'cf-set-rows' }, ...rows),
     status,
-    el('div', { className: 'cf-set-actions' }, el('button', { className: 'cf-set-btn', type: 'button', onClick: load, disabled: state.busy }, t('page.reload'))),
+    el('div', { className: 'cf-set-actions' }, el('button', { className: 'cf-set-btn', type: 'button', onClick: load, disabled: state.busy }, tr('page.reload'))),
   )
 }
 

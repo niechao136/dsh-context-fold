@@ -47,8 +47,12 @@ const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 
  * harness keeps a state cursor that resets to 0 at the start of each render while
  * the backing array persists. Without that cursor every render would re-read index
  * 0 and the component would appear stuck in its initial state.
+ *
+ * Props are supplied as the slot kit does: the component reads `ops` (captured at
+ * registration) and `t` (the slot translator). It must never need a Cordis context
+ * — touching one during render throws "cannot get property … without inject".
  */
-function mount(render: (props: unknown) => unknown) {
+function mount(render: (props: unknown) => unknown, props: Record<string, unknown> = {}) {
   const states: unknown[] = []
   const effects: (() => void)[] = []
   let cursor = 0
@@ -74,7 +78,7 @@ function mount(render: (props: unknown) => unknown) {
   let tree: unknown
   const rerender = (): void => {
     cursor = 0
-    tree = render({ react: seat })
+    tree = render({ react: seat, ...props })
   }
   const handle = {
     states,
@@ -160,6 +164,18 @@ function inputs(tree: unknown): Record<string, unknown>[] {
   return found
 }
 
+/**
+ * Mount the registered section with the props the slot would supply.
+ *
+ * The descriptor's `inject` factory is the supported way to hand a component the
+ * Host operations, so the harness calls it exactly as the slot does.
+ */
+function mountSection(registration: { descriptor: Record<string, unknown>; render: (props: unknown) => unknown }) {
+  const injectFactory = registration.descriptor['inject'] as (() => Record<string, unknown>) | undefined
+  const injected = injectFactory === undefined ? {} : injectFactory()
+  return mount(registration.render, injected)
+}
+
 describe('settings page registration', () => {
   it('registers a settings.section for this plugin', () => {
     const { remote } = makeRemote()
@@ -181,10 +197,34 @@ describe('settings page registration', () => {
     const registered = registrations[0]!.render
     expect(typeof registered).toBe('function')
     // A component is *called* by the host; an element would already be an object.
-    const page = mount(registered)
+    const page = mountSection(registrations[0]!)
     const tree = await page.start()
     expect(tree).not.toBeNull()
     // And it is a real page, not the empty section that a bad registration yields.
+    expect(inputs(tree).length).toBeGreaterThan(0)
+  })
+
+  it('never touches the Cordis context while rendering', async () => {
+    // `ctx.remote` throws "cannot get property … without inject" outside the
+    // apply scope, which is where a component body runs. The section therefore
+    // gets its operations through `inject`, captured against a context that is
+    // unreadable afterwards: if the component reached for ctx it would throw here.
+    const { remote } = makeRemote({ minFoldChars: 1000 })
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const trapped = new Proxy(
+      {},
+      {
+        get(_target, property) {
+          throw new Error(`component read ctx.${String(property)} during render`)
+        },
+      },
+    )
+    // Capture the injected operations while the real ctx is still live.
+    const injectFactory = registrations[0]!.descriptor['inject'] as (() => Record<string, unknown>) | undefined
+    const injected = injectFactory === undefined ? {} : injectFactory()
+    const page = mount(registrations[0]!.render, { ...injected, ctx: trapped })
+    const tree = await page.start()
     expect(inputs(tree).length).toBeGreaterThan(0)
   })
 
@@ -204,7 +244,7 @@ describe('settings page behaviour', () => {
     const { remote } = makeRemote({ minFoldChars: 1000, enabled: true })
     const { ctx, registrations } = makeCtx(remote)
     registerSettingsPage(ctx as never)
-    const page = mount(registrations[0]!.render)
+    const page = mountSection(registrations[0]!)
     const tree = await page.start()
     // 9 knobs: 2 booleans early, then numbers, then 2 booleans.
     expect(inputs(tree).length).toBe(9)
@@ -214,7 +254,7 @@ describe('settings page behaviour', () => {
     const { remote } = makeRemote({ minFoldChars: 1000, minBatchChars: 8000, enabled: true })
     const { ctx, registrations } = makeCtx(remote)
     registerSettingsPage(ctx as never)
-    const page = mount(registrations[0]!.render)
+    const page = mountSection(registrations[0]!)
     const tree = await page.start()
     const numbers = inputs(tree).filter((props) => props['type'] === 'number')
     const checks = inputs(tree).filter((props) => props['type'] === 'checkbox')
@@ -226,7 +266,7 @@ describe('settings page behaviour', () => {
     const { remote, writes } = makeRemote({ minFoldChars: 1000 })
     const { ctx, registrations } = makeCtx(remote)
     registerSettingsPage(ctx as never)
-    const page = mount(registrations[0]!.render)
+    const page = mountSection(registrations[0]!)
     const tree = await page.start()
     const number = inputs(tree).find((props) => props['type'] === 'number')!
     ;(number['onChange'] as (event: unknown) => void)({ currentTarget: { value: '1500' } })
@@ -241,7 +281,7 @@ describe('settings page behaviour', () => {
     const { remote, writes } = makeRemote({ minFoldChars: 1000 })
     const { ctx, registrations } = makeCtx(remote)
     registerSettingsPage(ctx as never)
-    const page = mount(registrations[0]!.render)
+    const page = mountSection(registrations[0]!)
     const tree = await page.start()
     const number = inputs(tree).find((props) => props['type'] === 'number')!
     ;(number['onChange'] as (event: unknown) => void)({ currentTarget: { value: '10' } })
@@ -254,7 +294,7 @@ describe('settings page behaviour', () => {
     const { remote, writes } = makeRemote({ dryRun: false })
     const { ctx, registrations } = makeCtx(remote)
     registerSettingsPage(ctx as never)
-    const page = mount(registrations[0]!.render)
+    const page = mountSection(registrations[0]!)
     const tree = await page.start()
     const firstCheck = inputs(tree).find((props) => props['type'] === 'checkbox')!
     ;(firstCheck['onChange'] as (event: unknown) => void)({ currentTarget: { checked: true } })
@@ -271,7 +311,7 @@ describe('settings page behaviour', () => {
     }
     const { ctx, registrations } = makeCtx(remote)
     registerSettingsPage(ctx as never)
-    const page = mount(registrations[0]!.render)
+    const page = mountSection(registrations[0]!)
     const tree = await page.start()
     expect(inputs(tree)).toHaveLength(0)
     let text = ''
@@ -285,7 +325,7 @@ describe('settings page behaviour', () => {
   it('degrades when the client has no settings remote at all', async () => {
     const { ctx, registrations } = makeCtx(undefined)
     registerSettingsPage(ctx as never)
-    const page = mount(registrations[0]!.render)
+    const page = mountSection(registrations[0]!)
     const tree = await page.start()
     expect(inputs(tree)).toHaveLength(0)
   })
