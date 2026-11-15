@@ -64,7 +64,7 @@ describe('multiple reasoning blocks in one message', () => {
 
   it('reports only the folded blocks, not the short one it kept', () => {
     // The report must measure exactly the blocks the decision folded. A message
-    // that keeps a 900-char block (below MIN_REASONING_CHARS) must not have that
+    // that keeps a short block (below MIN_REASONING_CHARS) must not have that
     // block's characters attributed to the fold.
     const session = Session.create('reason-report' as never, undefined, undefined, undefined, [reasoningProjection as never])
     session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
@@ -75,7 +75,8 @@ describe('multiple reasoning blocks in one message', () => {
       message: createAssistantMessage({
         content: [
           { type: 'reasoning', text: 'a'.repeat(3000) },
-          { type: 'reasoning', text: 'b'.repeat(900) },
+          // Comfortably below the current gate (900): this one must be kept.
+          { type: 'reasoning', text: 'b'.repeat(400) },
           { type: 'tool-call', id: 'call_r' as never, name: 'read', arguments: '{}' },
         ],
         source: { provider: 'test', model: 'test' },

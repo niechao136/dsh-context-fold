@@ -114,8 +114,28 @@ declare module '@deepseek-ai/dsh-session/types' {
  */
 const HEAD_CHARS = 240
 
-/** Smallest reasoning block worth folding. Below this the pointer costs as much as the text. */
-const MIN_REASONING_CHARS = 1200
+/**
+ * Smallest reasoning block worth folding.
+ *
+ * The folded form is a fixed cost: a 240-character head plus the marker and the
+ * omission note, which measures ~328 characters regardless of input size. That
+ * fixes the profitability curve, measured against the real fold function:
+ *
+ * | input | output | saved |
+ * |-------|--------|-------|
+ * |  600  |  328   |  45%  |
+ * |  700  |  328   |  53%  |
+ * |  900  |  328   |  64%  |
+ * | 1200  |  330   |  73%  |
+ *
+ * The original gate was 1200, which is profitable but excludes most of the
+ * surface: measured sessions have a ~510-character median reasoning block, so
+ * 1200 skipped the bulk of the available saving. 600 was the first proposal and
+ * only breaks even politely at 45%. 900 is the point where the fold saves
+ * roughly two thirds of the block while still reaching well below the median
+ * session's larger blocks — the best trade between reach and margin.
+ */
+const MIN_REASONING_CHARS = 900
 
 /**
  * Whether a reasoning block is already folded.

@@ -369,10 +369,27 @@ function FoldItem(props: { sessionId: string; fold: FoldRow }): unknown {
 }
 
 /** The per-fold list card. */
+/**
+ * The per-fold list: searchable, filterable, and paged by turn.
+ *
+ * Ordering is newest-first. A fold log is read from the live end — "what just
+ * got folded?" is the common question — so the highest turn/step sorts to the
+ * top rather than making the reader scroll to the bottom of a long session.
+ *
+ * Paging is by *turn*, not by row count: folds cluster per turn, and jumping to
+ * "turn 4" is how someone reasons about a conversation. A turn filter narrows
+ * the same list rather than a separate view, so search and filter compose.
+ */
 function FoldList(props: { sessionId: string; report: FoldReportPayload }): unknown {
   const { report, sessionId } = props
-  const title = el('div', { className: 'cf-card-title', key: 'h' }, `Folded content · ${String(report.folds.length)}`)
-  if (report.folds.length === 0) {
+  const [query, setQuery] = react.useState('')
+  const [kind, setKind] = react.useState<'all' | FoldRow['kind']>('all')
+  const [turn, setTurn] = react.useState<number | 'all'>('all')
+
+  const folds = report.folds
+  const title = el('div', { className: 'cf-card-title', key: 'h' }, `Folded content · ${String(folds.length)}`)
+
+  if (folds.length === 0) {
     return el(
       'section',
       { className: 'cf-card' },
@@ -385,16 +402,105 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload }): unkn
       ),
     )
   }
-  return el(
-    'section',
-    { className: 'cf-card' },
-    title,
+
+  // Newest first, then a stable tiebreak on seq so a re-render never reorders
+  // rows the reader is looking at.
+  const ordered = [...folds].sort((a, b) => b.turn - a.turn || b.step - a.step || b.seq - a.seq)
+
+  const turns = [...new Set(ordered.map((fold) => fold.turn))].sort((a, b) => b - a)
+  const needle = query.trim().toLowerCase()
+  const visible = ordered.filter((fold) => {
+    if (kind !== 'all' && fold.kind !== kind) return false
+    if (turn !== 'all' && fold.turn !== turn) return false
+    if (needle === '') return true
+    // Match on the inline conclusion, the tool name, and the locator: those are
+    // the three things a reader actually searches for after the fact.
+    const haystack = `${fold.toolName ?? ''}\n${fold.inline}\n${fold.locator ?? ''}`.toLowerCase()
+    return haystack.includes(needle)
+  })
+
+  const reasoningCount = ordered.filter((fold) => fold.kind === 'reasoning').length
+  const toolCount = ordered.length - reasoningCount
+
+  const controls = el(
+    'div',
+    { className: 'cf-controls', key: 'c' },
+    el('input', {
+      className: 'cf-search',
+      type: 'search',
+      placeholder: 'Search conclusion, tool or path…',
+      value: query,
+      onInput: (event: { currentTarget?: { value?: string } }) => setQuery(event.currentTarget?.value ?? ''),
+    }),
     el(
       'div',
-      { className: 'cf-folds' },
-      ...report.folds.map((fold) => el(FoldItem, { key: String(fold.seq), sessionId, fold })),
+      { className: 'cf-seg' },
+      ...[
+        ['all', `All ${String(ordered.length)}`],
+        ['tool-result', `Tool ${String(toolCount)}`],
+        ['reasoning', `Reasoning ${String(reasoningCount)}`],
+      ].map(([value, label]) =>
+        el(
+          'button',
+          {
+            key: String(value),
+            type: 'button',
+            className: kind === value ? 'cf-seg-btn cf-seg-on' : 'cf-seg-btn',
+            onClick: () => setKind(value as 'all' | FoldRow['kind']),
+          },
+          String(label),
+        ),
+      ),
     ),
   )
+
+  const turnBar =
+    turns.length <= 1
+      ? null
+      : el(
+          'div',
+          { className: 'cf-turns', key: 't' },
+          el(
+            'button',
+            {
+              type: 'button',
+              className: turn === 'all' ? 'cf-turn cf-turn-on' : 'cf-turn',
+              onClick: () => setTurn('all'),
+            },
+            'All turns',
+          ),
+          ...turns.map((value) =>
+            el(
+              'button',
+              {
+                key: String(value),
+                type: 'button',
+                className: turn === value ? 'cf-turn cf-turn-on' : 'cf-turn',
+                onClick: () => setTurn(value),
+              },
+              `T${String(value)}`,
+            ),
+          ),
+        )
+
+  const summary = el(
+    'div',
+    { className: 'cf-list-note', key: 'n' },
+    visible.length === ordered.length
+      ? `${String(ordered.length)} fold(s), newest first`
+      : `${String(visible.length)} of ${String(ordered.length)} fold(s) match`,
+  )
+
+  const rows =
+    visible.length === 0
+      ? el('div', { className: 'cf-empty', key: 'x' }, 'No fold matches this filter.')
+      : el(
+          'div',
+          { className: 'cf-folds', key: 'f' },
+          ...visible.map((fold) => el(FoldItem, { key: String(fold.seq), sessionId, fold })),
+        )
+
+  return el('section', { className: 'cf-card' }, title, controls, turnBar, summary, rows)
 }
 
 /**

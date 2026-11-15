@@ -209,6 +209,12 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
       // cannot express a plugin-record carrier; the runtime accepts any event
       // type (see the reasoning module header).
       sessions.registerMessageProjection(reasoningProjection)
+      // Say so out loud. A missing projection is invisible from the outside:
+      // `deriveEventMessage` ignores a plugin event it has no projection for, so
+      // records are written, the tab counts them, and nothing is folded. Without
+      // this line the only symptom is "folding looks like it does nothing" —
+      // exactly the failure that took a full log dig to find once.
+      ctx.logger.info('context-fold: reasoning projection registered')
     } catch (error) {
       // The host allows exactly one definition per event type, and `apply()` can
       // run twice (a reload, or two rows naming the same package). A duplicate is
