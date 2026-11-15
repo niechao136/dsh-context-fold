@@ -249,13 +249,21 @@ export interface SettingsOps {
  * @returns the operations, or undefined when the remote is absent.
  */
 export function settingsOpsOf(ctx: { remote?: { settings?: SettingsOps } }): SettingsOps | undefined {
-  const settings = ctx.remote?.settings
+  let settings: SettingsOps | undefined
+  try {
+    settings = ctx.remote?.settings
+  } catch {
+    // A Cordis context throws rather than returning undefined when its service is
+    // not resolvable in the current scope. Treat that as "no remote": a missing
+    // settings service must not be able to break plugin activation.
+    return undefined
+  }
   if (settings === undefined) return undefined
   // Bind so the returned functions keep working after the render pass; the
   // methods are captured here, not looked up later.
   return {
-    describe: () => settings.describe(),
-    mutate: (ns, ops, revision) => settings.mutate(ns, ops, revision),
+    describe: () => settings!.describe(),
+    mutate: (ns, ops, revision) => settings!.mutate(ns, ops, revision),
   }
 }
 
@@ -272,9 +280,14 @@ export function settingsOpsOf(ctx: { remote?: { settings?: SettingsOps } }): Set
  * @returns the slot disposer, when the host returns one.
  */
 export function registerSettingsPage(ctx: SettingsPageContext): unknown {
-  // Resolve every Cordis service touch here, while this `apply` scope is still
-  // live. The component below must never read `ctx` itself: its body runs during
-  // render, outside the inject scope, where `ctx.remote` throws.
+  // Resolve the Host operations once, here in the apply scope. The component below
+  // must never read `ctx` itself: its body runs during render, long after
+  // `apply()` returned, where the context no longer resolves services.
+  //
+  // This is safe only because the plugin's `inject` declares BOTH `remote` and
+  // `remote.settings`. Declaring just the dotted name leaves `ctx.remote`
+  // unresolvable and this line throws — the failure that stopped the plugin from
+  // activating at all.
   const ops = settingsOpsOf(ctx)
   const label = (key: string): string => translate(ctx, key)
 

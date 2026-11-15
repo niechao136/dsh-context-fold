@@ -584,11 +584,14 @@ export const name = 'context-fold-client'
 /**
  * Client services this plugin needs.
  *
- * `remote.settings` is what backs the configuration page: without it in the inject
- * list the `settings` remote is not guaranteed to be resolved when `apply()` runs,
- * and the page would render "unavailable" against a live host.
+ * `remote` and `remote.settings` are **both** required, and that is not
+ * redundant: each dotted name gates a separate readiness latch, but property
+ * access starts at `ctx.remote`. Declaring only `remote.settings` leaves
+ * `ctx.remote` itself unresolvable, so `ctx.remote.settings` throws
+ * `cannot get property "remote" without inject` — which is what failed the whole
+ * client plugin with "dsh-context-fold: loading" at web boot.
  */
-export const inject = ['slots', 'locale', 'remote.settings']
+export const inject = ['slots', 'locale', 'remote', 'remote.settings']
 
 /**
  * Mount the conversation tab.

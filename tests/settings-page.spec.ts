@@ -329,4 +329,32 @@ describe('settings page behaviour', () => {
     const tree = await page.start()
     expect(inputs(tree)).toHaveLength(0)
   })
+
+  it('survives a context whose remote cannot be resolved', async () => {
+    // Web boot once failed with "dsh-context-fold: loading" because `apply()`
+    // threw: a Cordis context raises on an undeclared service instead of
+    // returning undefined, and `remote.settings` alone does not make `ctx.remote`
+    // resolvable. Registration must degrade, never throw — a missing settings
+    // service cannot be allowed to take the whole client plugin down.
+    const registrations: { descriptor: Record<string, unknown>; render: (props: unknown) => unknown }[] = []
+    const throwing = {
+      get remote(): never {
+        throw new Error('cannot get property "remote" without inject')
+      },
+      slots: {
+        inject: (_name: string, register: () => unknown) => register(),
+        register: (descriptor: Record<string, unknown>, render: (props: unknown) => unknown) => {
+          registrations.push({ descriptor, render })
+          return () => {}
+        },
+      },
+      locale: { register: () => () => {}, bind: () => (key: string) => en[key] ?? key },
+    }
+    expect(() => registerSettingsPage(throwing as never)).not.toThrow()
+    expect(registrations).toHaveLength(1)
+    // And the page itself reports the missing namespace rather than crashing.
+    const page = mountSection(registrations[0]!)
+    const tree = await page.start()
+    expect(inputs(tree)).toHaveLength(0)
+  })
 })
