@@ -20,6 +20,14 @@
  * The original text of every fold is shown on demand, fetched by its recovery
  * path, so the tab doubles as the answer to "what exactly did it remove".
  *
+ * ## How this file is shipped
+ *
+ * `tsdown` wraps the output in the shell's module-factory form
+ * (`window.__ModuleLoader__.load({id, factory(require){…}})`), which is the only
+ * shape the client module system executes. Imports are therefore converted into
+ * `require` calls resolved against the shared platform module table, and the
+ * plugin's exports (`name`/`inject`/`apply`) are what the factory returns.
+ *
  * @module dsh-context-fold/client
  */
 
@@ -74,6 +82,20 @@ export interface FoldReportPayload {
   reReads: number
 }
 
+/**
+ * The shell hands this bundle its `require` through the module factory, and
+ * resolves bare ids such as `react` against the shared platform module table.
+ */
+declare function require(id: string): unknown
+
+/** The slice of the React runtime a tab needs. */
+interface ReactFace {
+  createElement(type: unknown, props?: Record<string, unknown> | null, ...children: unknown[]): unknown
+  useState<T>(initial: T): [T, (next: T) => void]
+  useRef<T>(value: T): { current: T }
+  useEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void
+}
+
 /** Minimal cordis client shape this plugin touches. */
 interface ClientContext {
   slots: {
@@ -81,12 +103,31 @@ interface ClientContext {
     register(descriptor: Record<string, unknown>, render: (props: unknown) => unknown): unknown
   }
   locale: {
-    get(key: string): string
+    register(namespace: string, dictionaries: Record<string, Record<string, string>>): unknown
+    bind(namespace: string): (key: string) => string
   }
+  effect?(run: () => unknown, label?: string): unknown
 }
+
+/** Locale namespace owned by this plugin's client half. */
+const NS = 'contextFold'
+
+/** Dictionary: keep keys aligned with `locale/*.json`. */
+const zh: Record<string, string> = {
+  'tab.contextFold': '上下文折叠',
+}
+
+/** Dictionary: keep keys aligned with `locale/*.json`. */
+const en: Record<string, string> = {
+  'tab.contextFold': 'Context fold',
+}
+
+const react = require('react') as ReactFace
 
 /** Fetch the report for one session. */
 async function fetchReport(sessionId: string): Promise<FoldReportPayload | undefined> {
+  // Absolute: these are the exact paths the server registers on the connection
+  // route registry, and the shell serves the GUI from the origin root.
   const response = await fetch('/api/context-fold/report', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -120,56 +161,52 @@ function signed(value: number): string {
   return `${rounded > 0 ? '+' : ''}${num(rounded)}`
 }
 
-/**
- * Render the tab body.
- *
- * Deliberately plain DOM (no framework import): the plugin's render prop may be
- * called from any client runtime, and depending on a specific React bundle would
- * couple this package to one shell version.
- *
- * @param props - slot props carrying the active session id.
- * @returns an element or a node tree.
- */
-function renderTab(props: unknown): unknown {
-  const sessionId = (props as { sessionId?: string } | undefined)?.sessionId
-  const root = document.createElement('div')
-  root.className = 'context-fold-tab'
-  root.style.cssText = 'padding:12px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;overflow:auto;height:100%'
+/** Cached per-session report, so re-renders do not refetch on every paint. */
+interface ReportState {
+  /** `loading` until the first response lands. */
+  status: 'loading' | 'ready' | 'empty'
+  /** The payload when `status === 'ready'`. */
+  report?: FoldReportPayload
+}
 
-  const title = document.createElement('div')
-  title.textContent = 'Context fold'
-  title.style.cssText = 'font-weight:600;margin-bottom:8px'
-  root.append(title)
+/** Read the active session id out of the slot props. */
+function sessionIdOf(props: unknown): string | undefined {
+  const value = (props as { sessionId?: unknown } | undefined)?.sessionId
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
 
-  const status = document.createElement('div')
-  status.style.cssText = 'color:#888'
-  status.textContent = sessionId === undefined ? 'No active session.' : 'Loading…'
-  root.append(status)
-
-  if (sessionId !== undefined) {
-    void fetchReport(sessionId).then((report) => {
-      root.replaceChildren(title)
-      if (report === undefined) {
-        status.textContent = 'No report available for this session.'
-        root.append(status)
-        return
-      }
-      root.append(renderSummary(report), renderFolds(sessionId, report))
-    })
-  }
-  return root
+/** Inline styles, kept as plain objects because no CSS module ships here. */
+const styles = {
+  root: { padding: '12px', font: '13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace', overflow: 'auto', height: '100%' },
+  title: { fontWeight: 600, marginBottom: '8px' },
+  muted: { color: '#888' },
+  box: { marginBottom: '12px', padding: '8px', border: '1px solid #333', borderRadius: '6px' },
+  heading: { fontWeight: 600, marginBottom: '6px' },
+  table: { borderCollapse: 'collapse' as const },
+  labelCell: { padding: '1px 12px 1px 0', color: '#aaa' },
+  warning: { marginTop: '6px', color: '#facc15' },
+  reread: { marginTop: '6px', color: '#f87171' },
+  fold: { marginBottom: '6px', padding: '6px', border: '1px solid #2a2a2a', borderRadius: '6px' },
+  foldSummary: { cursor: 'pointer' },
+  inlinePre: { whiteSpace: 'pre-wrap' as const, margin: '6px 0', color: '#bbb', maxHeight: '12em', overflow: 'auto' },
+  originalPre: {
+    whiteSpace: 'pre-wrap' as const,
+    margin: '6px 0',
+    color: '#ddd',
+    maxHeight: '24em',
+    overflow: 'auto',
+    borderTop: '1px dashed #333',
+    paddingTop: '6px',
+  },
+  locator: { color: '#666', fontSize: '11px', wordBreak: 'break-all' as const },
+  notRecoverable: { color: '#f87171', fontSize: '11px' },
+  detailsToggle: { cursor: 'pointer', color: '#888', marginTop: '6px' },
+  assumptionList: { margin: '4px 0 0 16px', padding: 0, color: '#999' },
 }
 
 /** The counterfactual summary block. */
-function renderSummary(report: FoldReportPayload): HTMLElement {
-  const cf = report.counterfactual
-  const box = document.createElement('section')
-  box.style.cssText = 'margin-bottom:12px;padding:8px;border:1px solid #333;border-radius:6px'
-
-  const heading = document.createElement('div')
-  heading.textContent = 'Token comparison (estimate)'
-  heading.style.cssText = 'font-weight:600;margin-bottom:6px'
-
+function Summary(props: { report: FoldReportPayload }): unknown {
+  const cf = props.report.counterfactual
   const rows: [string, string][] = [
     ['Folded content, now', `${num(cf.tokensNow)} tokens`],
     ['If it had stayed unfolded', `${num(cf.tokensIfUnfolded)} tokens`],
@@ -179,108 +216,160 @@ function renderSummary(report: FoldReportPayload): HTMLElement {
     ['Prefix invalidation cost', signed(-cf.invalidationCost)],
     ['Net', signed(cf.netSaving)],
   ]
-  const table = document.createElement('table')
-  table.style.cssText = 'border-collapse:collapse'
-  for (const [label, value] of rows) {
-    const tr = document.createElement('tr')
-    const th = document.createElement('td')
-    th.textContent = label
-    th.style.cssText = 'padding:1px 12px 1px 0;color:#aaa'
-    const td = document.createElement('td')
-    td.textContent = value
-    if (label === 'Net') {
-      // A negative net must read as a loss at a glance.
-      td.style.cssText = `font-weight:600;color:${cf.netSaving >= 0 ? '#4ade80' : '#f87171'}`
-    }
-    tr.append(th, td)
-    table.append(tr)
-  }
-
-  const freshness = document.createElement('div')
-  freshness.style.cssText = 'margin-top:6px;color:#facc15'
-  freshness.textContent = cf.hasRealUsage
-    ? `Priced against this session's real usage${cf.cacheReadShare === undefined ? '' : ` (cache-read share ${(cf.cacheReadShare * 100).toFixed(1)}%)`}.`
-    : 'This session reported NO provider usage — every figure here is heuristic token counts, not a bill.'
-
-  const assumptions = document.createElement('details')
-  const summary = document.createElement('summary')
-  summary.textContent = 'Assumptions'
-  summary.style.cssText = 'cursor:pointer;color:#888;margin-top:6px'
-  assumptions.append(summary)
-  const list = document.createElement('ul')
-  list.style.cssText = 'margin:4px 0 0 16px;padding:0;color:#999'
-  for (const assumption of cf.assumptions) {
-    const item = document.createElement('li')
-    item.textContent = assumption
-    list.append(item)
-  }
-  assumptions.append(list)
-
-  box.append(heading, table, freshness, assumptions)
-  if (report.reReads > 0) {
-    const reread = document.createElement('div')
-    reread.style.cssText = 'margin-top:6px;color:#f87171'
-    reread.textContent = `Re-read signals: ${String(report.reReads)} — folded content was fetched again after being folded.`
-    box.append(reread)
-  }
-  return box
+  return react.createElement(
+    'section',
+    { style: styles.box },
+    react.createElement('div', { style: styles.heading, key: 'h' }, 'Token comparison (estimate)'),
+    react.createElement(
+      'table',
+      { style: styles.table, key: 't' },
+      ...rows.map(([label, value]) =>
+        react.createElement(
+          'tr',
+          { key: label },
+          react.createElement('td', { style: styles.labelCell }, label),
+          react.createElement(
+            'td',
+            // A negative net must read as a loss at a glance.
+            label === 'Net'
+              ? { style: { fontWeight: 600, color: cf.netSaving >= 0 ? '#4ade80' : '#f87171' } }
+              : null,
+            value,
+          ),
+        ),
+      ),
+    ),
+    react.createElement(
+      'div',
+      { style: styles.warning, key: 'f' },
+      cf.hasRealUsage
+        ? `Priced against this session's real usage${cf.cacheReadShare === undefined ? '' : ` (cache-read share ${(cf.cacheReadShare * 100).toFixed(1)}%)`}.`
+        : 'This session reported NO provider usage — every figure here is heuristic token counts, not a bill.',
+    ),
+    react.createElement(
+      'details',
+      { key: 'a' },
+      react.createElement('summary', { style: styles.detailsToggle }, 'Assumptions'),
+      react.createElement(
+        'ul',
+        { style: styles.assumptionList },
+        ...cf.assumptions.map((assumption, index) => react.createElement('li', { key: String(index) }, assumption)),
+      ),
+    ),
+    props.report.reReads > 0
+      ? react.createElement(
+          'div',
+          { style: styles.reread, key: 'r' },
+          `Re-read signals: ${String(props.report.reReads)} — folded content was fetched again after being folded.`,
+        )
+      : null,
+  )
 }
 
-/** The per-fold list, with the original text expandable. */
-function renderFolds(sessionId: string, report: FoldReportPayload): HTMLElement {
-  const section = document.createElement('section')
-  const heading = document.createElement('div')
-  heading.textContent = `Folded content (${String(report.folds.length)})`
-  heading.style.cssText = 'font-weight:600;margin-bottom:6px'
-  section.append(heading)
+/** One fold row; the original text loads when the row is opened. */
+function FoldItem(props: { sessionId: string; fold: FoldRow }): unknown {
+  const { fold, sessionId } = props
+  const [original, setOriginal] = react.useState<string | null>(null)
 
-  if (report.folds.length === 0) {
-    const empty = document.createElement('div')
-    empty.style.cssText = 'color:#888'
-    empty.textContent = 'Nothing has been folded in this session yet.'
-    section.append(empty)
-    return section
+  const onToggle = (event: { currentTarget?: { open?: boolean } }): void => {
+    // The point of folding is that this text is expensive: fetch it once, and
+    // only when the reader actually opens the row.
+    if (event.currentTarget?.open !== true || original !== null) return
+    const locator = fold.locator
+    if (locator === undefined) return
+    setOriginal('')
+    void fetchOriginal(sessionId, locator).then((text) => {
+      setOriginal(text ?? '(could not read the stored original)')
+    })
   }
 
-  for (const fold of report.folds) {
-    const item = document.createElement('details')
-    item.style.cssText = 'margin-bottom:6px;padding:6px;border:1px solid #2a2a2a;border-radius:6px'
-    const summary = document.createElement('summary')
-    summary.style.cssText = 'cursor:pointer'
-    summary.textContent = `${fold.kind === 'reasoning' ? 'reasoning' : (fold.toolName ?? 'tool')} · turn ${String(fold.turn)}.${String(fold.step)} · ${num(fold.charsBefore)} → ${num(fold.charsAfter)} chars · ${fold.recoverable ? 'recoverable' : 'NOT recoverable'}`
-    item.append(summary)
+  const label = fold.kind === 'reasoning' ? 'reasoning' : (fold.toolName ?? 'tool')
+  const summary = `${label} · turn ${String(fold.turn)}.${String(fold.step)} · ${num(fold.charsBefore)} → ${num(fold.charsAfter)} chars · ${fold.recoverable ? 'recoverable' : 'NOT recoverable'}`
 
-    const inline = document.createElement('pre')
-    inline.textContent = fold.inline
-    inline.style.cssText = 'white-space:pre-wrap;margin:6px 0;color:#bbb;max-height:12em;overflow:auto'
-    item.append(inline)
-
-    if (fold.locator !== undefined) {
-      const path = document.createElement('div')
-      path.textContent = fold.locator
-      path.style.cssText = 'color:#666;font-size:11px;word-break:break-all'
-      item.append(path)
-
-      // Load lazily: the point of folding is that this text is expensive.
-      item.addEventListener('toggle', () => {
-        if (!item.open || item.dataset['loaded'] === '1') return
-        item.dataset['loaded'] = '1'
-        void fetchOriginal(sessionId, fold.locator!).then((text) => {
-          const pre = document.createElement('pre')
-          pre.textContent = text ?? '(could not read the stored original)'
-          pre.style.cssText = 'white-space:pre-wrap;margin:6px 0;color:#ddd;max-height:24em;overflow:auto;border-top:1px dashed #333;padding-top:6px'
-          item.append(pre)
-        })
-      })
-    } else if (!fold.recoverable) {
-      const warning = document.createElement('div')
-      warning.textContent = 'No recovery path: the original is in the session log but no tool exposes it.'
-      warning.style.cssText = 'color:#f87171;font-size:11px'
-      item.append(warning)
+  const children: unknown[] = [
+    react.createElement('summary', { style: styles.foldSummary, key: 's' }, summary),
+    react.createElement('pre', { style: styles.inlinePre, key: 'i' }, fold.inline),
+  ]
+  if (fold.locator !== undefined) {
+    children.push(react.createElement('div', { style: styles.locator, key: 'l' }, fold.locator))
+    if (original !== null) {
+      children.push(react.createElement('pre', { style: styles.originalPre, key: 'o' }, original))
     }
-    section.append(item)
+  } else if (!fold.recoverable) {
+    children.push(
+      react.createElement(
+        'div',
+        { style: styles.notRecoverable, key: 'w' },
+        'No recovery path: the original is in the session log but no tool exposes it.',
+      ),
+    )
   }
-  return section
+
+  return react.createElement('details', { style: styles.fold, onToggle }, ...children)
+}
+
+/** The per-fold list. */
+function FoldList(props: { sessionId: string; report: FoldReportPayload }): unknown {
+  const { report, sessionId } = props
+  const heading = react.createElement(
+    'div',
+    { style: styles.heading, key: 'h' },
+    `Folded content (${String(report.folds.length)})`,
+  )
+  if (report.folds.length === 0) {
+    return react.createElement(
+      'section',
+      null,
+      heading,
+      react.createElement('div', { style: styles.muted, key: 'e' }, 'Nothing has been folded in this session yet.'),
+    )
+  }
+  return react.createElement(
+    'section',
+    null,
+    heading,
+    ...report.folds.map((fold) => react.createElement(FoldItem, { key: String(fold.seq), sessionId, fold })),
+  )
+}
+
+/**
+ * The tab body.
+ *
+ * The active session id arrives through the standard slot props, and the report
+ * is refetched whenever that id changes because the tab outlives navigation.
+ */
+function ContextFoldTab(props: unknown): unknown {
+  const sessionId = sessionIdOf(props)
+  const [state, setState] = react.useState<ReportState>({ status: 'loading' })
+
+  react.useEffect(() => {
+    if (sessionId === undefined) {
+      setState({ status: 'empty' })
+      return
+    }
+    let cancelled = false
+    setState({ status: 'loading' })
+    void fetchReport(sessionId).then((report) => {
+      if (cancelled) return
+      setState(report === undefined ? { status: 'empty' } : { status: 'ready', report })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [sessionId])
+
+  const children: unknown[] = [react.createElement('div', { style: styles.title, key: 'title' }, 'Context fold')]
+  if (sessionId === undefined) {
+    children.push(react.createElement('div', { style: styles.muted, key: 'm' }, 'No active session.'))
+  } else if (state.status === 'loading') {
+    children.push(react.createElement('div', { style: styles.muted, key: 'm' }, 'Loading…'))
+  } else if (state.status !== 'ready' || state.report === undefined) {
+    children.push(react.createElement('div', { style: styles.muted, key: 'm' }, 'No report available for this session.'))
+  } else {
+    children.push(react.createElement(Summary, { key: 'summary', report: state.report }))
+    children.push(react.createElement(FoldList, { key: 'folds', sessionId, report: state.report }))
+  }
+  return react.createElement('div', { className: 'context-fold-tab', style: styles.root }, ...children)
 }
 
 /** Client plugin name. */
@@ -292,9 +381,31 @@ export const inject = ['slots', 'locale']
 /**
  * Mount the conversation tab.
  *
+ * Dictionaries are registered from inside this bundle: the locale service reads
+ * them from the plugin registry, not from `locale/*.json` on disk.
+ *
  * @param ctx - client plugin context.
  */
 export function apply(ctx: ClientContext): void {
+  const registerDictionaries = (): void => {
+    ctx.locale.register(NS, { zh, en })
+  }
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(registerDictionaries, 'context-fold: dictionaries')
+  } else {
+    registerDictionaries()
+  }
+
+  const t = (key: string): string => {
+    // Fall back to the English dictionary so a missing service never renders a
+    // raw key in the tab strip.
+    try {
+      return ctx.locale.bind(NS)(key) || (en[key] ?? key)
+    } catch {
+      return en[key] ?? key
+    }
+  }
+
   ctx.slots.inject('conversation.view', () =>
     ctx.slots.register(
       {
@@ -302,9 +413,10 @@ export function apply(ctx: ClientContext): void {
         id: 'context-fold',
         // After dsh-context's fleet tab (30) so the two read in a stable order.
         order: 40,
-        label: () => ctx.locale.get('tab.contextFold'),
+        locale: NS,
+        label: () => t('tab.contextFold'),
       },
-      renderTab,
+      ContextFoldTab,
     ),
   )
 }
