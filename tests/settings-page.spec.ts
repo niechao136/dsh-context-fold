@@ -1,0 +1,256 @@
+import { describe, expect, it } from 'vitest'
+import { registerSettingsPage } from '../src/settings-page.ts'
+
+/**
+ * The settings page is the only path to the plugin's knobs in the GUI: the host
+ * can generate a form from the schema, but no shipped client renders one, so the
+ * page is hand-built here. These tests drive it against a fake settings remote to
+ * pin the read/write contract.
+ *
+ * The fake React seat implements `useState`/`useEffect` with immediate (non-batched)
+ * updates. A real client re-renders after a state change; the harness models that
+ * by re-invoking `render()` after each `effect()` and promise flush, which is why
+ * the tree is re-read after loading instead of being captured once.
+ */
+
+interface Node {
+  type: unknown
+  props: Record<string, unknown>
+  children: unknown[]
+}
+
+function isNode(value: unknown): value is Node {
+  return typeof value === 'object' && value !== null && 'type' in value && 'props' in value
+}
+
+/** Walk a rendered tree. */
+function walk(node: unknown, visit: (node: Node) => void): void {
+  if (Array.isArray(node)) {
+    for (const child of node) walk(child, visit)
+    return
+  }
+  if (!isNode(node)) return
+  visit(node)
+  for (const child of node.children) walk(child, visit)
+}
+
+/** Flush pending promise callbacks. */
+const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+/**
+ * A tiny React stand-in plus a mounted component handle that can re-render.
+ *
+ * React identifies hook slots by call order within one component instance, so the
+ * harness keeps a state cursor that resets to 0 at the start of each render while
+ * the backing array persists. Without that cursor every render would re-read index
+ * 0 and the component would appear stuck in its initial state.
+ */
+function mount(render: (props: unknown) => unknown) {
+  const states: unknown[] = []
+  const effects: (() => void)[] = []
+  let cursor = 0
+  const seat = {
+    createElement(type: unknown, props?: Record<string, unknown> | null, ...children: unknown[]): unknown {
+      return { type, props: props ?? {}, children }
+    },
+    useState<T>(initial: T): [T, (next: T | ((previous: T) => T)) => void] {
+      const index = cursor++
+      if (!(index in states)) states[index] = initial
+      const set = (next: T | ((previous: T) => T)): void => {
+        const previous = states[index] as T
+        states[index] = typeof next === 'function' ? (next as (p: T) => T)(previous) : next
+      }
+      return [states[index] as T, set]
+    },
+    useEffect(effect: () => void | (() => void)): void {
+      // Effects run once per mount, matching the page's empty dependency list.
+      cursor++
+      effects.push(effect as () => void)
+    },
+  }
+  let tree: unknown
+  const rerender = (): void => {
+    cursor = 0
+    tree = render({ react: seat })
+  }
+  const handle = {
+    states,
+    /** Render once, run queued effects, and settle into the loaded tree. */
+    async start(): Promise<unknown> {
+      rerender()
+      for (const effect of effects.splice(0)) effect()
+      await flush()
+      rerender()
+      return tree
+    },
+    /** Re-render after an interaction, then settle. */
+    async settle(): Promise<unknown> {
+      await flush()
+      rerender()
+      return tree
+    },
+    get current(): unknown {
+      return tree
+    },
+  }
+  return handle
+}
+
+/** A fake settings remote backed by an in-memory namespace. */
+function makeRemote(initial: Record<string, unknown> = {}) {
+  const writes: { ns: string; ops: readonly { op: string; path: string[]; value?: unknown }[]; revision: number }[] = []
+  const state = { value: { ...initial }, revision: 3, writable: true }
+  return {
+    writes,
+    state,
+    remote: {
+      settings: {
+        describe: async () => ({
+          ok: true,
+          value: {
+            namespaces: [
+              { ns: 'context-fold', value: state.value, user: state.value, revision: state.revision, writable: state.writable },
+            ],
+          },
+        }),
+        mutate: async (ns: string, ops: readonly { op: string; path: string[]; value?: unknown }[], revision: number) => {
+          writes.push({ ns, ops, revision })
+          for (const op of ops) if (op.op === 'set' && op.path[0] !== undefined) state.value[op.path[0]] = op.value
+          state.revision += 1
+          return { ok: true, value: {} }
+        },
+      },
+    },
+  }
+}
+
+/** Build a client context that records the registered section. */
+function makeCtx(remote: unknown) {
+  const registrations: { descriptor: Record<string, unknown>; render: (props: unknown) => unknown }[] = []
+  return {
+    registrations,
+    ctx: {
+      slots: {
+        inject: (_name: string, register: () => unknown) => register(),
+        register: (descriptor: Record<string, unknown>, render: (props: unknown) => unknown) => {
+          registrations.push({ descriptor, render })
+          return () => {}
+        },
+      },
+      locale: { register: () => () => {}, bind: () => (key: string) => key },
+      remote,
+    },
+  }
+}
+
+/** All `<input>` nodes with their props. */
+function inputs(tree: unknown): Record<string, unknown>[] {
+  const found: Record<string, unknown>[] = []
+  walk(tree, (node) => {
+    if (node.type === 'input') found.push(node.props)
+  })
+  return found
+}
+
+describe('settings page registration', () => {
+  it('registers a settings.section for this plugin', () => {
+    const { remote } = makeRemote()
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    expect(registrations).toHaveLength(1)
+    expect(registrations[0]!.descriptor['name']).toBe('settings.section')
+    expect(registrations[0]!.descriptor['id']).toBe('context-fold')
+    expect(typeof registrations[0]!.render).toBe('function')
+  })
+})
+
+describe('settings page behaviour', () => {
+  it('renders a control for every knob once loaded', async () => {
+    const { remote } = makeRemote({ minFoldChars: 1000, enabled: true })
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const page = mount(registrations[0]!.render)
+    const tree = await page.start()
+    // 9 knobs: 2 booleans early, then numbers, then 2 booleans.
+    expect(inputs(tree).length).toBe(9)
+  })
+
+  it('reads the effective values from the namespace view', async () => {
+    const { remote } = makeRemote({ minFoldChars: 1000, minBatchChars: 8000, enabled: true })
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const page = mount(registrations[0]!.render)
+    const tree = await page.start()
+    const numbers = inputs(tree).filter((props) => props['type'] === 'number')
+    const checks = inputs(tree).filter((props) => props['type'] === 'checkbox')
+    expect(numbers.some((props) => props['value'] === '1000')).toBe(true)
+    expect(checks.some((props) => props['checked'] === true)).toBe(true)
+  })
+
+  it('writes a field through mutate with the current revision', async () => {
+    const { remote, writes } = makeRemote({ minFoldChars: 1000 })
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const page = mount(registrations[0]!.render)
+    const tree = await page.start()
+    const number = inputs(tree).find((props) => props['type'] === 'number')!
+    ;(number['onChange'] as (event: unknown) => void)({ currentTarget: { value: '1500' } })
+    await page.settle()
+    expect(writes).toHaveLength(1)
+    expect(writes[0]!.ns).toBe('context-fold')
+    expect(writes[0]!.ops[0]).toEqual({ op: 'set', path: ['minFoldChars'], value: 1500 })
+    expect(writes[0]!.revision).toBe(3)
+  })
+
+  it('clamps a numeric write to the schema floor instead of sending a bad value', async () => {
+    const { remote, writes } = makeRemote({ minFoldChars: 1000 })
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const page = mount(registrations[0]!.render)
+    const tree = await page.start()
+    const number = inputs(tree).find((props) => props['type'] === 'number')!
+    ;(number['onChange'] as (event: unknown) => void)({ currentTarget: { value: '10' } })
+    await page.settle()
+    // minFoldChars floors at 300.
+    expect(writes[0]!.ops[0]!.value).toBe(300)
+  })
+
+  it('writes a boolean through mutate', async () => {
+    const { remote, writes } = makeRemote({ dryRun: false })
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const page = mount(registrations[0]!.render)
+    const tree = await page.start()
+    const firstCheck = inputs(tree).find((props) => props['type'] === 'checkbox')!
+    ;(firstCheck['onChange'] as (event: unknown) => void)({ currentTarget: { checked: true } })
+    await page.settle()
+    expect(writes[0]!.ops[0]).toEqual({ op: 'set', path: ['enabled'], value: true })
+  })
+
+  it('reports an unavailable namespace rather than rendering empty controls', async () => {
+    const remote = {
+      settings: {
+        describe: async () => ({ ok: true, value: { namespaces: [] } }),
+        mutate: async () => ({ ok: true }),
+      },
+    }
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const page = mount(registrations[0]!.render)
+    const tree = await page.start()
+    expect(inputs(tree)).toHaveLength(0)
+    let text = ''
+    walk(tree, (node) => {
+      for (const child of node.children) if (typeof child === 'string') text += child
+    })
+    expect(text).toContain('page.unavailable')
+  })
+
+  it('degrades when the client has no settings remote at all', async () => {
+    const { ctx, registrations } = makeCtx(undefined)
+    registerSettingsPage(ctx as never)
+    const page = mount(registrations[0]!.render)
+    const tree = await page.start()
+    expect(inputs(tree)).toHaveLength(0)
+  })
+})

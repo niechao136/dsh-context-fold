@@ -31,6 +31,7 @@
  * @module dsh-context-fold/client
  */
 import { ensurePanelCss } from './panel-css.ts'
+import { ensureSettingsCss, registerSettingsPage, type SettingsPageContext } from './settings-page.ts'
 
 /** One fold row as the server reports it. */
 export interface FoldRow {
@@ -107,6 +108,8 @@ interface ClientContext {
     register(namespace: string, dictionaries: Record<string, Record<string, string>>): unknown
     bind(namespace: string): (key: string) => string
   }
+  /** Remote namespaces; `settings` backs the configuration page. */
+  remote?: SettingsPageContext['remote']
   effect?(run: () => unknown, label?: string): unknown
 }
 
@@ -572,8 +575,14 @@ function ContextFoldTab(props: unknown): unknown {
 /** Client plugin name. */
 export const name = 'context-fold-client'
 
-/** The tab needs the slot registry and the locale service. */
-export const inject = ['slots', 'locale']
+/**
+ * Client services this plugin needs.
+ *
+ * `remote.settings` is what backs the configuration page: without it in the inject
+ * list the `settings` remote is not guaranteed to be resolved when `apply()` runs,
+ * and the page would render "unavailable" against a live host.
+ */
+export const inject = ['slots', 'locale', 'remote.settings']
 
 /**
  * Mount the conversation tab.
@@ -618,4 +627,13 @@ export function apply(ctx: ClientContext): void {
       ContextFoldTab,
     ),
   )
+
+  // A settings section of our own. The host can generate a form from the schema
+  // (`configure({ auto: true })`, done on the server half), but no shipped client
+  // renders that yet, so without this the knobs stay unreachable in the GUI.
+  ensureSettingsCss()
+  const page = registerSettingsPage(ctx as unknown as SettingsPageContext)
+  if (typeof page === 'function' && typeof ctx.effect === 'function') {
+    ctx.effect(() => page as () => void, 'context-fold: settings section')
+  }
 }
