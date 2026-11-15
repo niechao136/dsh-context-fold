@@ -15,6 +15,7 @@
  * @module dsh-context-fold/routes
  */
 import type { Session } from '@deepseek-ai/dsh-session'
+import type { Message } from '@deepseek-ai/dsh-llm'
 import type { SpillStore } from '@deepseek-ai/dsh-spill'
 import { counterfactualOf, usageOf, type FoldedSaving } from './counterfactual.ts'
 import { reportOf } from './measure.ts'
@@ -54,8 +55,15 @@ export interface ReportValue {
 export interface RouteDeps {
   /** Resolve a live session by id. */
   sessionOf(id: string): Session | undefined
-  /** Price one message, from the token meter. */
-  estimateMessage(message: never): number
+  /**
+   * Price one message, from the token meter.
+   *
+   * The token meter walks `message.content`, so this must be a *real* `Message`
+   * from the session log — handing it a bare content array throws
+   * `blocks is not iterable` at runtime, and a synthesized object is not
+   * assignable to `Message`.
+   */
+  estimateMessage(message: Message): number
   /** Spill store, for reading originals back. */
   spillStore?: SpillStore
 }
@@ -92,7 +100,9 @@ export function buildReport(session: Session, deps: RouteDeps): ReportValue {
     const event = session.eventAt(fold.seq as never)
     const message = event === undefined ? null : session.deriveEventMessage(event)
     const content = message !== null && message.role === 'tool' ? message.content : undefined
-    const tokensAfter = content === undefined ? 0 : deps.estimateMessage(content as never)
+    // `estimateMessage` needs the real message (it walks `message.content` and
+    // reads identity fields); a synthesized `{role, content}` is not assignable.
+    const tokensAfter = message === null ? 0 : deps.estimateMessage(message)
     const inline = inlineTextOf(content) ?? ''
     const locator = locatorOf(inline)
     folds.push({
@@ -132,8 +142,11 @@ export function buildReport(session: Session, deps: RouteDeps): ReportValue {
           step,
           charsBefore: target.chars?.[position] ?? 0,
           charsAfter: Array.from(block.text).length,
+          // Both sides of this row price one reasoning block, so they share the
+          // char-based estimator. `estimateMessage` would price the whole
+          // message and would also need a real `Message`, not a synthesized one.
           tokensBefore: estimateFromChars(target.chars?.[position] ?? 0),
-          tokensAfter: deps.estimateMessage([{ type: 'text', text: block.text }] as never),
+          tokensAfter: estimateFromChars(Array.from(block.text).length),
           inline: block.text,
           recoverable: locator !== undefined,
           ...(locator === undefined ? {} : { locator }),

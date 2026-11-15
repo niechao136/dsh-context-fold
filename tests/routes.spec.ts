@@ -5,6 +5,7 @@ import { resolveConfig } from '../src/config.ts'
 import { locatorOf, buildReport, registerRoutes, readOriginal, type RouteDeps } from '../src/routes.ts'
 import { FOLD_MARKER } from '../src/format.ts'
 import { planReasoningFolds, reasoningCandidates, reasoningProjection, recordReasoningFolds } from '../src/reasoning.ts'
+import { foldBatch, planFor } from '../src/session.ts'
 
 describe('locatorOf', () => {
   it('reads the phase-1 tool locator', () => {
@@ -46,8 +47,11 @@ function sessionWithFolds(): Session {
 
 const deps = (): RouteDeps => ({
   sessionOf: () => undefined,
-  estimateMessage: (message: { content?: readonly { text?: string }[] }) => {
-    const text = (message.content ?? []).map((block) => block.text ?? '').join('')
+  // Mirrors the real token meter: it reads `message.content`, so the parameter
+  // is a whole `Message`. Typing it as a message is what keeps the production
+  // call site honest — a bare content array no longer typechecks.
+  estimateMessage: (message) => {
+    const text = message.content.map((block) => ('text' in block ? block.text : '')).join('')
     return Math.round(Array.from(text).length / 3.5)
   },
 })
@@ -129,5 +133,52 @@ describe('readOriginal', () => {
 
   it('returns undefined when the store cannot read', async () => {
     expect(await readOriginal(deps(), '/spill/a.txt')).toBeUndefined()
+  })
+})
+
+describe('token meter contract', () => {
+  it('prices reasoning folds through the real estimator without throwing', async () => {
+    // Regression: the report once handed `estimateMessage` a bare content array.
+    // The real estimator walks `message.content`, so that threw
+    // "blocks is not iterable" and every report request failed with it. Wiring
+    // the genuine estimator in here is what makes this test able to catch it —
+    // a hand-written fake happily accepted the wrong shape.
+    const { estimateMessage } = await import('@deepseek-ai/dsh-token-meter/estimate')
+    const session = sessionWithFolds()
+    await recordReasoningFolds(
+      session,
+      planReasoningFolds(reasoningCandidates(session), 2, 9, resolveConfig()),
+      { saveText: async () => ({ locator: '/spill/reason.txt' }) },
+    )
+    const report = buildReport(session, {
+      ...deps(),
+      estimateMessage: (message) => estimateMessage(message as never),
+    })
+    expect(report.folds.length).toBeGreaterThan(0)
+    for (const fold of report.folds) expect(Number.isFinite(fold.tokensAfter)).toBe(true)
+  })
+
+  it('prices a tool-result fold through the real estimator without throwing', async () => {
+    // The tool-result branch is the one the live tab hit: it derives the node's
+    // message and prices it. Folding first is what makes that branch non-empty.
+    const { estimateMessage } = await import('@deepseek-ai/dsh-token-meter/estimate')
+    const session = sessionWithFolds()
+    const decision = planFor(session, 2, 30, resolveConfig({ minBatchChars: 100, keepRecentSteps: 2, staleSteps: 12, minFoldChars: 1000 }))
+    await foldBatch(
+      {
+        session,
+        spillStore: { saveText: async () => ({ locator: '/spill/tool.txt', id: 't1' }) } as never,
+        config: resolveConfig({ minBatchChars: 100, keepRecentSteps: 2, staleSteps: 12, minFoldChars: 1000 }),
+        estimateMessage: (message) => estimateMessage(message as never),
+      },
+      decision.batches[0]!,
+    )
+    const report = buildReport(session, {
+      ...deps(),
+      estimateMessage: (message) => estimateMessage(message as never),
+    })
+    const toolFolds = report.folds.filter((fold) => fold.kind === 'tool-result')
+    expect(toolFolds.length).toBeGreaterThan(0)
+    for (const fold of toolFolds) expect(Number.isFinite(fold.tokensAfter)).toBe(true)
   })
 })
