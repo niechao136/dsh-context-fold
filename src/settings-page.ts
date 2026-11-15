@@ -28,10 +28,10 @@
 interface FieldSpec {
   /** Config key. */
   key: string
-  /** Label. */
-  label: string
-  /** Help text under the control. */
-  hint: string
+  /** Dictionary key for the label. */
+  labelKey: string
+  /** Dictionary key for the help text under the control. */
+  hintKey: string
   /** Control kind. */
   kind: 'number' | 'boolean'
   /** Lower bound, for numbers. */
@@ -42,68 +42,58 @@ interface FieldSpec {
 
 /** The knobs, in reading order: what to fold, then how, then whether. */
 const FIELDS: readonly FieldSpec[] = [
-  {
-    key: 'enabled',
-    label: 'Enable folding',
-    hint: 'Turn stage-boundary folding on or off for the whole session.',
-    kind: 'boolean',
-  },
-  {
-    key: 'dryRun',
-    label: 'Dry run',
-    hint: 'Compute and report candidates without mutating the session. Useful for judging a threshold change before applying it.',
-    kind: 'boolean',
-  },
+  { key: 'enabled', labelKey: 'field.enabled.label', hintKey: 'field.enabled.hint', kind: 'boolean' },
+  { key: 'dryRun', labelKey: 'field.dryRun.label', hintKey: 'field.dryRun.hint', kind: 'boolean' },
   {
     key: 'minFoldChars',
-    label: 'Minimum tool result size',
-    hint: 'Skip tool results smaller than this many characters. Never below 300 — below that the marker costs as much as the text it replaces.',
+    labelKey: 'field.minFoldChars.label',
+    hintKey: 'field.minFoldChars.hint',
     kind: 'number',
     min: 300,
     max: 1_000_000,
   },
   {
     key: 'minBatchChars',
-    label: 'Minimum batch size',
-    hint: 'Only fold a batch of candidates whose combined size reaches this many characters.',
+    labelKey: 'field.minBatchChars.label',
+    hintKey: 'field.minBatchChars.hint',
     kind: 'number',
     min: 1,
     max: 10_000_000,
   },
   {
     key: 'keepRecentSteps',
-    label: 'Keep recent steps',
-    hint: 'Never fold a result from the newest N steps: those are the ones still being reasoned about.',
+    labelKey: 'field.keepRecentSteps.label',
+    hintKey: 'field.keepRecentSteps.hint',
     kind: 'number',
     min: 0,
     max: 1000,
   },
   {
     key: 'staleSteps',
-    label: 'Stale after',
-    hint: 'Age in steps after which a result may fold inside one long turn.',
+    labelKey: 'field.staleSteps.label',
+    hintKey: 'field.staleSteps.hint',
     kind: 'number',
     min: 1,
     max: 10_000,
   },
   {
     key: 'batchSpanSteps',
-    label: 'Batch span',
-    hint: 'Split a turn longer than this many steps into contiguous sub-batches.',
+    labelKey: 'field.batchSpanSteps.label',
+    hintKey: 'field.batchSpanSteps.hint',
     kind: 'number',
     min: 1,
     max: 10_000,
   },
   {
     key: 'foldReasoning',
-    label: 'Fold reasoning',
-    hint: 'Fold reasoning blocks on historical tool-call turns. Reasoning on plain turns is never re-sent, so it is not folded.',
+    labelKey: 'field.foldReasoning.label',
+    hintKey: 'field.foldReasoning.hint',
     kind: 'boolean',
   },
   {
     key: 'foldPlainTurnReasoning',
-    label: 'Fold reasoning on plain turns',
-    hint: 'Enable only when the route re-sends plain-turn reasoning (e.g. dsh-router-core). dsh-llm-deepseek drops it, so folding there saves nothing.',
+    labelKey: 'field.foldPlainTurnReasoning.label',
+    hintKey: 'field.foldPlainTurnReasoning.hint',
     kind: 'boolean',
   },
 ]
@@ -167,9 +157,11 @@ function translate(ctx: SettingsPageContext, key: string): string {
   try {
     const bound = ctx.locale.bind(SETTINGS_NS)(key)
     if (typeof bound === 'string' && bound !== '' && bound !== key) return bound
-    return en[key] ?? zh[key] ?? key
+    // Chinese first: the UI defaults to Chinese, and the dictionaries are authored
+    // zh-first. English is the fallback for a shell running another language.
+    return zh[key] ?? en[key] ?? key
   } catch {
-    return en[key] ?? zh[key] ?? key
+    return zh[key] ?? en[key] ?? key
   }
 }
 
@@ -186,6 +178,25 @@ const zh: Record<string, string> = {
   'page.loading': '读取中…',
   'page.readonly': '当前配置不可写。',
   'page.unavailable': '此插件的配置命名空间未注册。',
+
+  'field.enabled.label': '启用折叠',
+  'field.enabled.hint': '为整个会话开启或关闭阶段边界折叠。',
+  'field.dryRun.label': '试运行',
+  'field.dryRun.hint': '只计算并报告候选，不改动会话。适合在正式调整阈值前先看效果。',
+  'field.minFoldChars.label': '工具结果最小长度',
+  'field.minFoldChars.hint': '小于该字符数的工具结果不折叠。最低 300 —— 再短的话，标记本身的开销就抵得上被替换的正文了。',
+  'field.minBatchChars.label': '批量最小长度',
+  'field.minBatchChars.hint': '只有当一批候选合计达到该字符数时才折叠。',
+  'field.keepRecentSteps.label': '保留最近步数',
+  'field.keepRecentSteps.hint': '最近 N 步的结果不折叠：这些内容还在被推理使用。',
+  'field.staleSteps.label': '超过多少步算陈旧',
+  'field.staleSteps.hint': '结果在同一个长回合里停留超过这么多步后，就可以被折叠。',
+  'field.batchSpanSteps.label': '分批跨度',
+  'field.batchSpanSteps.hint': '回合超过这么多步时，按连续区间拆成多个子批次分别处理。',
+  'field.foldReasoning.label': '折叠思考过程',
+  'field.foldReasoning.hint': '折叠历史工具调用轮次里的思考内容。纯文本轮的思考不会被重发，因此不折叠。',
+  'field.foldPlainTurnReasoning.label': '折叠纯文本轮的思考',
+  'field.foldPlainTurnReasoning.hint': '只有当路由会重发纯文本轮思考时才需要开启（例如 dsh-router-core）。dsh-llm-deepseek 会直接丢弃它，折了也省不到。',
 }
 
 /** English strings. */
@@ -201,6 +212,25 @@ const en: Record<string, string> = {
   'page.loading': 'Loading…',
   'page.readonly': 'This configuration is not writable.',
   'page.unavailable': 'The configuration namespace for this plugin is not registered.',
+
+  'field.enabled.label': 'Enable folding',
+  'field.enabled.hint': 'Turn stage-boundary folding on or off for the whole session.',
+  'field.dryRun.label': 'Dry run',
+  'field.dryRun.hint': 'Compute and report candidates without mutating the session. Useful for judging a threshold change before applying it.',
+  'field.minFoldChars.label': 'Minimum tool result size',
+  'field.minFoldChars.hint': 'Skip tool results smaller than this many characters. Never below 300 — below that the marker costs as much as the text it replaces.',
+  'field.minBatchChars.label': 'Minimum batch size',
+  'field.minBatchChars.hint': 'Only fold a batch of candidates whose combined size reaches this many characters.',
+  'field.keepRecentSteps.label': 'Keep recent steps',
+  'field.keepRecentSteps.hint': 'Never fold a result from the newest N steps: those are the ones still being reasoned about.',
+  'field.staleSteps.label': 'Stale after',
+  'field.staleSteps.hint': 'Age in steps after which a result may fold inside one long turn.',
+  'field.batchSpanSteps.label': 'Batch span',
+  'field.batchSpanSteps.hint': 'Split a turn longer than this many steps into contiguous sub-batches.',
+  'field.foldReasoning.label': 'Fold reasoning',
+  'field.foldReasoning.hint': 'Fold reasoning blocks on historical tool-call turns. Reasoning on plain turns is never re-sent, so it is not folded.',
+  'field.foldPlainTurnReasoning.label': 'Fold reasoning on plain turns',
+  'field.foldPlainTurnReasoning.hint': 'Enable only when the route re-sends plain-turn reasoning (e.g. dsh-router-core). dsh-llm-deepseek drops it, so folding there saves nothing.',
 }
 
 /** The namespace this plugin's Config is mounted under. */
@@ -478,12 +508,16 @@ function renderPage(react: ReactSeat, settings: SettingsOps | undefined, t?: (ke
   // Prefer the slot's translator (bound to this entry's locale namespace), then
   // this module's own dictionary. No service lookup: the component must not read
   // a Cordis context during render.
+  // Resolution order: the slot's translator, then Chinese, then English, then the
+  // raw key. Chinese comes before English deliberately — the dictionaries are
+  // authored zh-first and the UI defaults to Chinese, so a locale service that is
+  // missing or still loading must not downgrade the page to English.
   const tr = (key: string): string => {
     if (t !== undefined) {
       const translated = t(key)
       if (typeof translated === 'string' && translated !== '' && translated !== key) return translated
     }
-    return en[key] ?? zh[key] ?? key
+    return zh[key] ?? en[key] ?? key
   }
 
   const header = el(
@@ -542,8 +576,8 @@ function renderPage(react: ReactSeat, settings: SettingsOps | undefined, t?: (ke
       el(
         'div',
         { className: 'cf-set-label-col' },
-        el('label', { className: 'cf-set-label' }, field.label),
-        el('div', { className: 'cf-set-hint' }, field.hint),
+        el('label', { className: 'cf-set-label' }, tr(field.labelKey)),
+        el('div', { className: 'cf-set-hint' }, tr(field.hintKey)),
       ),
       el('div', { className: 'cf-set-control' }, control),
     )

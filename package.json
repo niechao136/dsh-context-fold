@@ -1,6 +1,6 @@
 {
   "name": "dsh-context-fold",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "description": "dsh-context-fold: stage-boundary folding of completed tool results into a conclusion plus a spill path, deterministic and replay-safe.",
   "type": "module",
   "main": "lib/index.js",

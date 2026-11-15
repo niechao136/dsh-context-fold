@@ -30,6 +30,7 @@
  *
  * @module dsh-context-fold/client
  */
+import { enDictionary, zhDictionary } from './client-dictionaries.ts'
 import { ensurePanelCss } from './panel-css.ts'
 import {
   SETTINGS_NS,
@@ -122,17 +123,56 @@ interface ClientContext {
 /** Locale namespace owned by this plugin's client half. */
 const NS = 'contextFold'
 
-/** Dictionary: keep keys aligned with `locale/*.json`. */
-const zh: Record<string, string> = {
-  'tab.contextFold': '上下文折叠',
-}
 
-/** Dictionary: keep keys aligned with `locale/*.json`. */
-const en: Record<string, string> = {
-  'tab.contextFold': 'Context fold',
-}
 
 const react = require('react') as ReactFace
+
+/**
+ * Build a translator bound to this plugin's namespace.
+ *
+ * Resolution order is: the shell's locale service, then the Chinese dictionary,
+ * then English, then the raw key. Chinese comes before English on purpose — the
+ * dictionaries are written zh-first, and a shell whose locale service is missing
+ * or still loading should not silently downgrade the UI to English.
+ *
+ * `{name}` placeholders are substituted from `params`, which keeps word order
+ * translatable instead of concatenating fragments at the call site.
+ *
+ * @param ctx - client context supplying the locale service.
+ * @returns a `t(key, params)` function.
+ */
+function makeTranslator(ctx: ClientContext): (key: string, params?: Record<string, string | number>) => string {
+  let bound: ((key: string) => string) | undefined
+  try {
+    bound = ctx.locale.bind(NS)
+  } catch {
+    // A missing locale service must not break the page; fall through to the
+    // bundled dictionaries.
+    bound = undefined
+  }
+  return (key, params) => {
+    let text: string | undefined
+    if (bound !== undefined) {
+      try {
+        const resolved = bound(key)
+        if (typeof resolved === 'string' && resolved !== '' && resolved !== key) text = resolved
+      } catch {
+        // Ignore a throwing lookup and use the bundled text.
+      }
+    }
+    text ??= zhDictionary[key] ?? enDictionary[key] ?? key
+    if (params === undefined) return text
+    return text.replace(/\{(\w+)\}/g, (match, name: string) =>
+      name in params ? String(params[name]) : match,
+    )
+  }
+}
+
+/** Translator signature. */
+type Translator = (key: string, params?: Record<string, string | number>) => string
+
+/** Placeholder helper kept for readability at call sites. */
+const translate = makeTranslator
 
 /** Fetch the report for one session. */
 async function fetchReport(sessionId: string): Promise<{ report: FoldReportPayload } | { error: string }> {
@@ -225,7 +265,8 @@ function Notice(props: { children: unknown; warn?: boolean }): unknown {
 }
 
 /** The counterfactual summary card. */
-function Summary(props: { report: FoldReportPayload }): unknown {
+function Summary(props: { report: FoldReportPayload; t: Translator }): unknown {
+  const t = props.t
   const cf = props.report.counterfactual
   const savedChars = props.report.folds.reduce((total, fold) => total + (fold.charsBefore - fold.charsAfter), 0)
   const netTone = cf.netSaving >= 0 ? 'good' : 'bad'
@@ -233,47 +274,47 @@ function Summary(props: { report: FoldReportPayload }): unknown {
   return el(
     'section',
     { className: 'cf-card' },
-    el('div', { className: 'cf-card-title', key: 'h' }, 'Token comparison'),
+    el('div', { className: 'cf-card-title', key: 'h' }, t('summary.title')),
     el(
       'div',
       { className: 'cf-grid', key: 'g' },
       el(Metric, {
         key: 'now',
-        label: 'Folded content now',
+        label: t('summary.now.label'),
         value: `${compact(cf.tokensNow)} tok`,
-        sub: 'what the window carries',
+        sub: t('summary.now.sub'),
       }),
       el(Metric, {
         key: 'before',
-        label: 'If never folded',
+        label: t('summary.before.label'),
         value: `${compact(cf.tokensIfUnfolded)} tok`,
-        sub: 'counterfactual',
+        sub: t('summary.before.sub'),
       }),
       el(Metric, {
         key: 'per',
-        label: 'Saving per step',
+        label: t('summary.perStep.label'),
         value: `${num(cf.tokensSavedPerStep)} tok`,
-        sub: `${num(cf.remainingSteps)} steps left`,
+        sub: t('summary.perStep.sub', { n: num(cf.remainingSteps) }),
       }),
       el(Metric, {
         key: 'gross',
-        label: 'Gross saving',
+        label: t('summary.gross.label'),
         value: signed(cf.grossSaving),
-        sub: 'before invalidation',
+        sub: t('summary.gross.sub'),
         tone: cf.grossSaving >= 0 ? 'good' : 'bad',
       }),
       el(Metric, {
         key: 'cost',
-        label: 'Invalidation cost',
+        label: t('summary.cost.label'),
         value: signed(-cf.invalidationCost),
-        sub: 'one-off prefix re-charge',
+        sub: t('summary.cost.sub'),
         tone: 'warn',
       }),
       el(Metric, {
         key: 'net',
-        label: 'Net',
+        label: t('summary.net.label'),
         value: signed(cf.netSaving),
-        sub: cf.netSaving >= 0 ? 'net win' : 'net loss — folded too late',
+        sub: cf.netSaving >= 0 ? t('summary.net.win') : t('summary.net.loss'),
         tone: netTone,
       }),
     ),
@@ -292,14 +333,18 @@ function Summary(props: { report: FoldReportPayload }): unknown {
             ? el(
                 'span',
                 null,
-                el('span', { className: 'cf-notice-strong' }, 'Priced against real usage. '),
-                `Cache-read share ${cf.cacheReadShare === undefined ? 'n/a' : `${(cf.cacheReadShare * 100).toFixed(1)}%`}.`,
+                el('span', { className: 'cf-notice-strong' }, t('summary.realUsage')),
+                ' ',
+                t('summary.cacheShare', {
+                  pct: cf.cacheReadShare === undefined ? 'n/a' : (cf.cacheReadShare * 100).toFixed(1),
+                }),
               )
             : el(
                 'span',
                 null,
-                el('span', { className: 'cf-notice-strong' }, 'Heuristic only. '),
-                'This session reported no provider usage, so these are token counts — not a bill.',
+                el('span', { className: 'cf-notice-strong' }, t('summary.heuristic')),
+                ' ',
+                t('summary.heuristicDetail'),
               ),
         ),
       ),
@@ -307,7 +352,10 @@ function Summary(props: { report: FoldReportPayload }): unknown {
     el(
       'div',
       { className: 'cf-aside', style: { marginTop: '10px' }, key: 'a' },
-      `${num(savedChars)} characters removed across ${String(props.report.folds.length)} fold(s).`,
+      t('summary.charsRemoved', {
+        chars: num(savedChars),
+        n: String(props.report.folds.length),
+      }),
     ),
     props.report.reReads > 0
       ? el(
@@ -316,18 +364,20 @@ function Summary(props: { report: FoldReportPayload }): unknown {
           el(
             'span',
             null,
-            el('span', { className: 'cf-notice-strong' }, `${String(props.report.reReads)} re-read signal(s). `),
-            'Folded content was fetched again after being folded — folding it may have cost more than it saved.',
+            el('span', { className: 'cf-notice-strong' }, t('summary.reReads', { n: String(props.report.reReads) })),
+            ' ',
+            t('summary.reReadsDetail'),
           ),
         )
       : null,
-    el('details', { key: 'asm', style: { marginTop: '10px' } }, el('summary', { className: 'cf-aside' }, 'Assumptions'), el('ul', { style: { margin: '6px 0 0 18px', padding: 0 }, }, ...cf.assumptions.map((assumption, index) => el('li', { className: 'cf-aside', key: String(index) }, assumption)))),
+    el('details', { key: 'asm', style: { marginTop: '10px' } }, el('summary', { className: 'cf-aside' }, t('summary.assumptions')), el('ul', { style: { margin: '6px 0 0 18px', padding: 0 }, }, ...cf.assumptions.map((assumption, index) => el('li', { className: 'cf-aside', key: String(index) }, assumption)))),
   )
 }
 
 /** One fold row; the original text loads when the row is opened. */
-function FoldItem(props: { sessionId: string; fold: FoldRow }): unknown {
+function FoldItem(props: { sessionId: string; fold: FoldRow; t: Translator }): unknown {
   const { fold, sessionId } = props
+  const t = props.t
   const [original, setOriginal] = react.useState<string | null>(null)
 
   const onToggle = (event: { currentTarget?: { open?: boolean } }): void => {
@@ -348,28 +398,28 @@ function FoldItem(props: { sessionId: string; fold: FoldRow }): unknown {
 
   const body: unknown[] = [
     el('div', { className: 'cf-fold-body', key: 'b' },
-      el('div', { className: 'cf-label' }, 'What stays in the window'),
+      el('div', { className: 'cf-label' }, t('fold.stays')),
       el('pre', { className: 'cf-pre' }, fold.inline),
       fold.locator !== undefined
         ? el('div', null,
-            el('div', { className: 'cf-label' }, 'Full original'),
+            el('div', { className: 'cf-label' }, t('fold.original')),
             original === null
-              ? el('div', { className: 'cf-aside' }, 'Expand to load from the recovery path.')
+              ? el('div', { className: 'cf-aside' }, t('fold.expandHint'))
               : el('pre', { className: 'cf-pre cf-pre-original' }, original),
             el('div', { className: 'cf-locator' }, fold.locator),
           )
         : el('div', { className: 'cf-aside cf-bad', style: { marginTop: '8px' } },
-            'No recovery path: the original is in the session log but no tool exposes it.'),
+            t('fold.noRecovery')),
     ),
   ]
 
   const children: unknown[] = [
     el('summary', { className: 'cf-fold-head', key: 'h' },
       el('span', { className: 'cf-caret' }, '▶'),
-      el('span', { className: tagClass }, isReasoning ? 'reasoning' : (fold.toolName ?? 'tool')),
-      el('span', { className: 'cf-fold-pos' }, `turn ${String(fold.turn)}.${String(fold.step)}`),
-      el('span', { className: 'cf-fold-pos' }, `${compact(fold.charsBefore)} → ${compact(fold.charsAfter)} chars`),
-      el('span', { className: 'cf-fold-saving' }, `−${compact(Math.max(0, saved))} tok`),
+      el('span', { className: tagClass }, isReasoning ? t('fold.reasoning') : (fold.toolName ?? 'tool')),
+      el('span', { className: 'cf-fold-pos' }, t('fold.pos', { t: String(fold.turn), s: String(fold.step) })),
+      el('span', { className: 'cf-fold-pos' }, t('fold.chars', { before: compact(fold.charsBefore), after: compact(fold.charsAfter) })),
+      el('span', { className: 'cf-fold-saving' }, t('fold.saved', { n: compact(Math.max(0, saved)) })),
     ),
   ]
   children.push(...body)
@@ -389,14 +439,15 @@ function FoldItem(props: { sessionId: string; fold: FoldRow }): unknown {
  * "turn 4" is how someone reasons about a conversation. A turn filter narrows
  * the same list rather than a separate view, so search and filter compose.
  */
-function FoldList(props: { sessionId: string; report: FoldReportPayload }): unknown {
+function FoldList(props: { sessionId: string; report: FoldReportPayload; t: Translator }): unknown {
   const { report, sessionId } = props
+  const t = props.t
   const [query, setQuery] = react.useState('')
   const [kind, setKind] = react.useState<'all' | FoldRow['kind']>('all')
   const [turn, setTurn] = react.useState<number | 'all'>('all')
 
   const folds = report.folds
-  const title = el('div', { className: 'cf-card-title', key: 'h' }, `Folded content · ${String(folds.length)}`)
+  const title = el('div', { className: 'cf-card-title', key: 'h' }, `${t('list.title')} · ${String(folds.length)}`)
 
   if (folds.length === 0) {
     return el(
@@ -406,8 +457,8 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload }): unkn
       el(
         'div',
         { className: 'cf-empty', key: 'e' },
-        el('div', { className: 'cf-empty-title' }, 'Nothing folded in this session yet'),
-        el('div', null, 'Folds appear once a step batch is old enough and large enough to be worth replacing.'),
+        el('div', { className: 'cf-empty-title' }, t('list.empty.title')),
+        el('div', null, t('list.empty.hint')),
       ),
     )
   }
@@ -437,7 +488,7 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload }): unkn
     el('input', {
       className: 'cf-search',
       type: 'search',
-      placeholder: 'Search conclusion, tool or path…',
+      placeholder: t('list.search'),
       value: query,
       onInput: (event: { currentTarget?: { value?: string } }) => setQuery(event.currentTarget?.value ?? ''),
     }),
@@ -445,9 +496,9 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload }): unkn
       'div',
       { className: 'cf-seg' },
       ...[
-        ['all', `All ${String(ordered.length)}`],
-        ['tool-result', `Tool ${String(toolCount)}`],
-        ['reasoning', `Reasoning ${String(reasoningCount)}`],
+        ['all', t('list.filter.all', { n: String(ordered.length) })],
+        ['tool-result', t('list.filter.tool', { n: String(toolCount) })],
+        ['reasoning', t('list.filter.reasoning', { n: String(reasoningCount) })],
       ].map(([value, label]) =>
         el(
           'button',
@@ -476,7 +527,7 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload }): unkn
               className: turn === 'all' ? 'cf-turn cf-turn-on' : 'cf-turn',
               onClick: () => setTurn('all'),
             },
-            'All turns',
+            t('list.allTurns'),
           ),
           ...turns.map((value) =>
             el(
@@ -487,7 +538,7 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload }): unkn
                 className: turn === value ? 'cf-turn cf-turn-on' : 'cf-turn',
                 onClick: () => setTurn(value),
               },
-              `T${String(value)}`,
+              t('list.turn', { n: String(value) }),
             ),
           ),
         )
@@ -496,20 +547,34 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload }): unkn
     'div',
     { className: 'cf-list-note', key: 'n' },
     visible.length === ordered.length
-      ? `${String(ordered.length)} fold(s), newest first`
-      : `${String(visible.length)} of ${String(ordered.length)} fold(s) match`,
+      ? t('list.countAll', { n: String(ordered.length) })
+      : t('list.countFiltered', { m: String(visible.length), n: String(ordered.length) }),
   )
 
   const rows =
     visible.length === 0
-      ? el('div', { className: 'cf-empty', key: 'x' }, 'No fold matches this filter.')
+      ? el('div', { className: 'cf-empty', key: 'x' }, t('list.noMatch'))
       : el(
           'div',
           { className: 'cf-folds', key: 'f' },
-          ...visible.map((fold) => el(FoldItem, { key: String(fold.seq), sessionId, fold })),
+          ...visible.map((fold) => el(FoldItem, { key: String(fold.seq), sessionId, fold, t })),
         )
 
   return el('section', { className: 'cf-card' }, title, controls, turnBar, summary, rows)
+}
+
+/**
+ * Translator for the tab body.
+ *
+ * The tab is a module-scoped component (the host wants a stable reference), so it
+ * cannot close over the per-apply context. `apply()` installs the bound translator
+ * here before registering, and the fallback keeps the component renderable if it
+ * is ever mounted out of order.
+ */
+let tabTranslator: Translator = (key, params) => {
+  const text = zhDictionary[key] ?? enDictionary[key] ?? key
+  if (params === undefined) return text
+  return text.replace(/\{(\w+)\}/g, (match, name: string) => (name in params ? String(params[name]) : match))
 }
 
 /**
@@ -538,13 +603,14 @@ function ContextFoldTab(props: unknown): unknown {
     }
   }, [sessionId])
 
+  const t = tabTranslator
   const head = el('div', { className: 'cf-head', key: 'head' },
-    el('span', { className: 'cf-head-title' }, 'Context fold'),
+    el('span', { className: 'cf-head-title' }, t('head.title')),
     sessionId === undefined
       ? null
       : el('span', { className: 'cf-head-note' }, state.status === 'ready'
-          ? `${String(state.report?.folds.length ?? 0)} fold(s) on the current surface`
-          : 'stage-boundary folding'),
+          ? t('tab.subtitle.summary', { n: String(state.report?.folds.length ?? 0) })
+          : t('tab.subtitle.default')),
   )
 
   const children: unknown[] = [head]
@@ -552,27 +618,27 @@ function ContextFoldTab(props: unknown): unknown {
     children.push(
       el('div', { className: 'cf-card' },
         el('div', { className: 'cf-empty' },
-          el('div', { className: 'cf-empty-title' }, 'No active session'),
-          el('div', null, 'Open a conversation to see its folds.'),
+          el('div', { className: 'cf-empty-title' }, t('state.noSession.title')),
+          el('div', null, t('state.noSession.hint')),
         ),
       ),
     )
   } else if (state.status === 'loading') {
-    children.push(el('div', { className: 'cf-card' }, el('div', { className: 'cf-empty' }, 'Loading…')))
+    children.push(el('div', { className: 'cf-card' }, el('div', { className: 'cf-empty' }, t('state.loading'))))
   } else if (state.status === 'error') {
     children.push(
       el('div', { className: 'cf-card' },
         el('div', { className: 'cf-empty' },
-          el('div', { className: 'cf-empty-title cf-bad' }, 'Could not load the report'),
+          el('div', { className: 'cf-empty-title cf-bad' }, t('state.error.title')),
           el('div', null, state.error ?? 'unknown error'),
         ),
       ),
     )
   } else if (state.status !== 'ready' || state.report === undefined) {
-    children.push(el('div', { className: 'cf-card' }, el('div', { className: 'cf-empty' }, 'This session has no folds to report.')))
+    children.push(el('div', { className: 'cf-card' }, el('div', { className: 'cf-empty' }, t('state.empty'))))
   } else {
-    children.push(el(Summary, { key: 'summary', report: state.report }))
-    children.push(el(FoldList, { key: 'folds', sessionId, report: state.report }))
+    children.push(el(Summary, { key: 'summary', report: state.report, t }))
+    children.push(el(FoldList, { key: 'folds', sessionId, report: state.report, t }))
   }
 
   return el('div', { className: 'cf-root' }, ...children)
@@ -609,7 +675,7 @@ export function apply(ctx: ClientContext): void {
   // one shows the raw key ("settings.nav") in the sidebar — which is exactly
   // what happened while only the tab's dictionary was registered.
   const registerDictionaries = (): void => {
-    ctx.locale.register(NS, { zh, en })
+    ctx.locale.register(NS, { zh: zhDictionary, en: enDictionary })
     ctx.locale.register(SETTINGS_NS, settingsDictionaries)
   }
   if (typeof ctx.effect === 'function') {
@@ -618,15 +684,8 @@ export function apply(ctx: ClientContext): void {
     registerDictionaries()
   }
 
-  const t = (key: string): string => {
-    // Fall back to the English dictionary so a missing service never renders a
-    // raw key in the tab strip.
-    try {
-      return ctx.locale.bind(NS)(key) || (en[key] ?? key)
-    } catch {
-      return en[key] ?? key
-    }
-  }
+  const t = makeTranslator(ctx)
+  tabTranslator = t
 
   ctx.slots.inject('conversation.view', () =>
     ctx.slots.register(

@@ -318,8 +318,9 @@ describe('settings page behaviour', () => {
     walk(tree, (node) => {
       for (const child of node.children) if (typeof child === 'string') text += child
     })
-    // The message is translated, so assert on the English text rather than the key.
-    expect(text).toContain(en['page.unavailable'])
+    // The message is translated, and Chinese is the default language, so assert
+    // on the Chinese text rather than the key (or the English fallback).
+    expect(text).toContain(settingsDictionaries.zh['page.unavailable'])
   })
 
   it('degrades when the client has no settings remote at all', async () => {

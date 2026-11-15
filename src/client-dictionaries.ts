@@ -1,0 +1,132 @@
+/**
+ * Conversation-tab dictionaries.
+ *
+ * Kept in their own module so tests can assert dictionary coverage without
+ * importing the client bundle, which expects a browser `window` at load time.
+ *
+ * @module dsh-context-fold/client-dictionaries
+ */
+
+/** 中文字典：界面默认语言。 */
+export const zhDictionary: Record<string, string> = {
+  'tab.contextFold': '上下文折叠',
+  'tab.subtitle.summary': '{n} 处已折叠',
+  'tab.subtitle.default': '阶段边界折叠',
+
+  'head.title': '上下文折叠',
+
+  'state.loading': '读取中…',
+  'state.noSession.title': '没有活动会话',
+  'state.noSession.hint': '打开一个对话即可查看其折叠情况。',
+  'state.error.title': '无法读取报告',
+  'state.empty': '此会话没有可折叠的内容。',
+
+  'summary.title': 'Token 对比',
+  'summary.now.label': '当前折叠后',
+  'summary.now.sub': '窗口实际承载',
+  'summary.before.label': '若从未折叠',
+  'summary.before.sub': '反事实估算',
+  'summary.perStep.label': '每步节省',
+  'summary.perStep.sub': '剩余 {n} 步',
+  'summary.gross.label': '总收益',
+  'summary.gross.sub': '失效成本之前',
+  'summary.cost.label': '失效成本',
+  'summary.cost.sub': '一次性前缀重算',
+  'summary.net.label': '净收益',
+  'summary.net.win': '净赚',
+  'summary.net.loss': '净亏 — 折叠得太晚',
+  'summary.realUsage': '按真实用量计价。',
+  'summary.cacheShare': '缓存命中率 {pct}%。',
+  'summary.heuristic': '仅为启发式估算。',
+  'summary.heuristicDetail': '此会话未上报服务商用量，这些是 token 计数，不是账单。',
+  'summary.charsRemoved': '共移除 {chars} 字符，涉及 {n} 处折叠。',
+  'summary.assumptions': '估算前提',
+  'summary.reReads': '{n} 次重读信号。',
+  'summary.reReadsDetail': '内容折叠后又被重新读取 —— 折叠它的开销可能超过收益。',
+
+  'list.title': '折叠明细',
+  'list.search': '搜索结论、工具名或路径…',
+  'list.filter.all': '全部 {n}',
+  'list.filter.tool': '工具 {n}',
+  'list.filter.reasoning': '思考 {n}',
+  'list.allTurns': '全部轮次',
+  'list.turn': 'T{n}',
+  'list.countAll': '共 {n} 处折叠，最新在前',
+  'list.countFiltered': '{m} / {n} 处匹配',
+  'list.empty.title': '此会话尚未折叠任何内容',
+  'list.empty.hint': '当某一步的批量足够旧且足够大时，就会出现折叠。',
+  'list.noMatch': '没有符合筛选条件的折叠。',
+
+  'fold.stays': '留在窗口里的内容',
+  'fold.original': '完整原文',
+  'fold.expandHint': '展开即从恢复路径载入。',
+  'fold.noRecovery': '没有恢复路径：原文仍在会话日志中，但没有工具可以取出。',
+  'fold.reasoning': '思考',
+  'fold.pos': '第 {t} 轮 · 第 {s} 步',
+  'fold.chars': '{before} → {after} 字符',
+  'fold.saved': '省 {n} tok',
+  'fold.recoverable': '可恢复',
+  'fold.unrecoverable': '不可恢复',
+}
+
+/** English dictionary: fallback when the shell runs in another language. */
+export const enDictionary: Record<string, string> = {
+  'tab.contextFold': 'Context fold',
+  'tab.subtitle.summary': '{n} fold(s) on the current surface',
+  'tab.subtitle.default': 'stage-boundary folding',
+
+  'head.title': 'Context fold',
+
+  'state.loading': 'Loading…',
+  'state.noSession.title': 'No active session',
+  'state.noSession.hint': 'Open a conversation to see its folds.',
+  'state.error.title': 'Could not load the report',
+  'state.empty': 'This session has no folds to report.',
+
+  'summary.title': 'Token comparison',
+  'summary.now.label': 'Folded content now',
+  'summary.now.sub': 'what the window carries',
+  'summary.before.label': 'If never folded',
+  'summary.before.sub': 'counterfactual',
+  'summary.perStep.label': 'Saving per step',
+  'summary.perStep.sub': '{n} steps left',
+  'summary.gross.label': 'Gross saving',
+  'summary.gross.sub': 'before invalidation',
+  'summary.cost.label': 'Invalidation cost',
+  'summary.cost.sub': 'one-off prefix re-charge',
+  'summary.net.label': 'Net',
+  'summary.net.win': 'net win',
+  'summary.net.loss': 'net loss — folded too late',
+  'summary.realUsage': 'Priced against real usage.',
+  'summary.cacheShare': 'Cache-read share {pct}%.',
+  'summary.heuristic': 'Heuristic only.',
+  'summary.heuristicDetail': 'This session reported no provider usage, so these are token counts — not a bill.',
+  'summary.charsRemoved': '{chars} characters removed across {n} fold(s).',
+  'summary.assumptions': 'Assumptions',
+  'summary.reReads': '{n} re-read signal(s).',
+  'summary.reReadsDetail': 'Folded content was fetched again after being folded — folding it may have cost more than it saved.',
+
+  'list.title': 'Folded content',
+  'list.search': 'Search conclusion, tool or path…',
+  'list.filter.all': 'All {n}',
+  'list.filter.tool': 'Tool {n}',
+  'list.filter.reasoning': 'Reasoning {n}',
+  'list.allTurns': 'All turns',
+  'list.turn': 'T{n}',
+  'list.countAll': '{n} fold(s), newest first',
+  'list.countFiltered': '{m} of {n} fold(s) match',
+  'list.empty.title': 'Nothing folded in this session yet',
+  'list.empty.hint': 'Folds appear once a step batch is old enough and large enough to be worth replacing.',
+  'list.noMatch': 'No fold matches this filter.',
+
+  'fold.stays': 'What stays in the window',
+  'fold.original': 'Full original',
+  'fold.expandHint': 'Expand to load from the recovery path.',
+  'fold.noRecovery': 'No recovery path: the original is in the session log but no tool exposes it.',
+  'fold.reasoning': 'reasoning',
+  'fold.pos': 'turn {t} · step {s}',
+  'fold.chars': '{before} → {after} chars',
+  'fold.saved': '−{n} tok',
+  'fold.recoverable': 'recoverable',
+  'fold.unrecoverable': 'NOT recoverable',
+}
