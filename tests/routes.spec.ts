@@ -91,10 +91,18 @@ describe('registerRoutes', () => {
   it('serves the report and rejects a bad request', async () => {
     const session = sessionWithFolds()
     const registrations: { path: string; fetch: (request: Request) => Promise<Response> }[] = []
-    registerRoutes(((definition: { path: string; fetch: (request: Request) => Promise<Response> }) => {
-      registrations.push(definition)
-      return () => {}
-    }) as never, { ...deps(), sessionOf: (id) => (id === 'route-1' ? session : undefined) })
+    // The host surface is `connection.fetch.register(...)`, not a callable
+    // connection object; the fixture mirrors that so this test fails if the
+    // production code ever drifts back to the wrong shape.
+    const connection = {
+      fetch: {
+        register(definition: { path: string; fetch: (request: Request) => Promise<Response> }) {
+          registrations.push(definition)
+          return () => {}
+        },
+      },
+    }
+    registerRoutes(connection, { ...deps(), sessionOf: (id) => (id === 'route-1' ? session : undefined) })
 
     expect(registrations.map((entry) => entry.path)).toEqual(['/api/context-fold/report', '/api/context-fold/original'])
 

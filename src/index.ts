@@ -220,22 +220,29 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
 
   // The conversation tab reads its data from these read-only routes: fold
   // decisions are durable plugin records and originals live in the log, neither
-  // reachable from the browser.
+  // reachable from the browser. Registration is an effect so the routes go away
+  // with the plugin.
   ctx.inject(['connection'], (scope) => {
     const connection = (scope as unknown as { connection?: ConnectionRoutes }).connection
-    if (connection === undefined) {
-      ctx.logger.warn('context-fold: no ctx.connection service; the conversation tab has no data source')
+    if (connection === undefined || typeof connection.fetch?.register !== 'function') {
+      ctx.logger.warn('context-fold: no ctx.connection.fetch.register; the conversation tab has no data source')
       return
     }
     const tokenMeter = ctx.get('tokenMeter') as TokenMeter | undefined
-    registerRoutes(connection, {
-      sessionOf: (id) => {
-        const sessions = ctx.get('sessions') as { get(id: string): Session | undefined } | undefined
-        return sessions?.get(id)
-      },
-      estimateMessage: (message) => (tokenMeter === undefined ? 0 : tokenMeter.estimateMessage(message)),
-      ...(ctx.get('spillStore') === undefined ? {} : { spillStore: ctx.get('spillStore') as SpillStore }),
-    })
+    // `register` returns its own disposer, but the host expects registration to
+    // happen inside an effect so an unload cannot leave the routes behind.
+    ctx.effect(
+      () =>
+        registerRoutes(connection, {
+          sessionOf: (id) => {
+            const sessions = ctx.get('sessions') as { get(id: string): Session | undefined } | undefined
+            return sessions?.get(id)
+          },
+          estimateMessage: (message) => (tokenMeter === undefined ? 0 : tokenMeter.estimateMessage(message)),
+          ...(ctx.get('spillStore') === undefined ? {} : { spillStore: ctx.get('spillStore') as SpillStore }),
+        }),
+      'context-fold: conversation tab routes',
+    )
   })
 
   ctx.on('session/disposed', (session) => {

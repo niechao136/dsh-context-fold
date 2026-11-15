@@ -207,9 +207,27 @@ export function fail(error: string): RouteReply {
   return { ok: false, error }
 }
 
-/** Minimal shape of the host's `connection` route registry. */
+/** One route definition, in the shape the host's connection service accepts. */
+export interface ConnectionRouteDefinition {
+  /** Absolute path the browser calls. */
+  path: string
+  /** HTTP methods this route answers. */
+  methods: string[]
+  /** `buffered` hands the handler a fully read `Request`. */
+  requestBody: string
+  /** The handler. */
+  fetch: (request: Request) => Promise<Response>
+}
+
+/** Minimal shape of the host's `connection` service. */
 export interface ConnectionRoutes {
-  (definition: { path: string; methods: string[]; requestBody: string; fetch: (request: Request) => Promise<Response> }): () => void
+  /**
+   * The route registry. Registration is an effect, so the caller must wrap the
+   * `register` call in `ctx.effect(...)` to make it dispose with the plugin.
+   */
+  fetch: {
+    register(definition: ConnectionRouteDefinition): () => void
+  }
 }
 
 /** JSON response matching the host's own convention. */
@@ -220,11 +238,12 @@ function json(value: unknown, status = 200): Response {
 /**
  * Register the two read-only routes the tab uses.
  *
- * @param register - the host route registrar.
+ * @param connection - the host `connection` service (its `fetch.register` is the route registrar).
  * @param deps - session and spill access.
  * @returns a disposer for both routes.
  */
-export function registerRoutes(register: ConnectionRoutes, deps: RouteDeps): () => void {
+export function registerRoutes(connection: ConnectionRoutes, deps: RouteDeps): () => void {
+  const register = connection.fetch.register.bind(connection.fetch)
   const report = register({
     path: '/api/context-fold/report',
     methods: ['POST'],

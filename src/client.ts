@@ -124,18 +124,39 @@ const en: Record<string, string> = {
 
 const react = require('react') as ReactFace
 
-/** Fetch the report for one session. */
-async function fetchReport(sessionId: string): Promise<FoldReportPayload | undefined> {
+/**
+ * Fetch the report for one session.
+ *
+ * Failures are reported rather than swallowed: before the routes existed the
+ * tab rendered "no report available", which reads like "this session folded
+ * nothing" instead of "the request never landed".
+ *
+ * @param sessionId - session to report on.
+ * @returns the payload, or a message describing why there is none.
+ */
+async function fetchReport(sessionId: string): Promise<{ report: FoldReportPayload } | { error: string }> {
   // Absolute: these are the exact paths the server registers on the connection
   // route registry, and the shell serves the GUI from the origin root.
-  const response = await fetch('/api/context-fold/report', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ sessionId }),
-  })
-  if (!response.ok) return undefined
-  const body = (await response.json()) as { ok?: boolean; value?: FoldReportPayload }
-  return body.ok === true ? body.value : undefined
+  let response: Response
+  try {
+    response = await fetch('/api/context-fold/report', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId }),
+    })
+  } catch (error) {
+    return { error: `request failed: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  const body = (await response.json().catch(() => undefined)) as
+    | { ok?: boolean; value?: FoldReportPayload; error?: string }
+    | undefined
+  if (!response.ok) {
+    return { error: body?.error ?? `HTTP ${String(response.status)}` }
+  }
+  if (body?.ok !== true || body.value === undefined) {
+    return { error: body?.error ?? 'the server returned no value' }
+  }
+  return { report: body.value }
 }
 
 /** Fetch the full text behind one fold. */
@@ -164,9 +185,11 @@ function signed(value: number): string {
 /** Cached per-session report, so re-renders do not refetch on every paint. */
 interface ReportState {
   /** `loading` until the first response lands. */
-  status: 'loading' | 'ready' | 'empty'
+  status: 'loading' | 'ready' | 'empty' | 'error'
   /** The payload when `status === 'ready'`. */
   report?: FoldReportPayload
+  /** The server's or the transport's complaint when `status === 'error'`. */
+  error?: string
 }
 
 /** Read the active session id out of the slot props. */
@@ -185,6 +208,7 @@ const styles = {
   table: { borderCollapse: 'collapse' as const },
   labelCell: { padding: '1px 12px 1px 0', color: '#aaa' },
   warning: { marginTop: '6px', color: '#facc15' },
+  error: { marginTop: '6px', color: '#f87171' },
   reread: { marginTop: '6px', color: '#f87171' },
   fold: { marginBottom: '6px', padding: '6px', border: '1px solid #2a2a2a', borderRadius: '6px' },
   foldSummary: { cursor: 'pointer' },
@@ -349,9 +373,9 @@ function ContextFoldTab(props: unknown): unknown {
     }
     let cancelled = false
     setState({ status: 'loading' })
-    void fetchReport(sessionId).then((report) => {
+    void fetchReport(sessionId).then((result) => {
       if (cancelled) return
-      setState(report === undefined ? { status: 'empty' } : { status: 'ready', report })
+      setState('report' in result ? { status: 'ready', report: result.report } : { status: 'error', error: result.error })
     })
     return () => {
       cancelled = true
@@ -363,8 +387,14 @@ function ContextFoldTab(props: unknown): unknown {
     children.push(react.createElement('div', { style: styles.muted, key: 'm' }, 'No active session.'))
   } else if (state.status === 'loading') {
     children.push(react.createElement('div', { style: styles.muted, key: 'm' }, 'Loading…'))
+  } else if (state.status === 'error') {
+    children.push(
+      react.createElement('div', { style: styles.error, key: 'e' }, `Could not load the report: ${state.error ?? 'unknown'}`),
+    )
   } else if (state.status !== 'ready' || state.report === undefined) {
-    children.push(react.createElement('div', { style: styles.muted, key: 'm' }, 'No report available for this session.'))
+    children.push(
+      react.createElement('div', { style: styles.muted, key: 'm' }, 'This session has no folds to report.'),
+    )
   } else {
     children.push(react.createElement(Summary, { key: 'summary', report: state.report }))
     children.push(react.createElement(FoldList, { key: 'folds', sessionId, report: state.report }))
