@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { registerSettingsPage } from '../src/settings-page.ts'
+import { registerSettingsPage, settingsDictionaries } from '../src/settings-page.ts'
+
+/** English dictionary, so a label assertion can check a real translation. */
+const en = settingsDictionaries.en
 
 /**
  * The settings page is the only path to the plugin's knobs in the GUI: the host
@@ -137,7 +140,12 @@ function makeCtx(remote: unknown) {
           return () => {}
         },
       },
-      locale: { register: () => () => {}, bind: () => (key: string) => key },
+      locale: {
+        register: () => () => {},
+        // Model the real service: a registered key resolves, an unregistered one
+        // returns the key itself (which is how "settings.nav" leaked out).
+        bind: () => (key: string) => en[key] ?? key,
+      },
       remote,
     },
   }
@@ -161,6 +169,33 @@ describe('settings page registration', () => {
     expect(registrations[0]!.descriptor['name']).toBe('settings.section')
     expect(registrations[0]!.descriptor['id']).toBe('context-fold')
     expect(typeof registrations[0]!.render).toBe('function')
+  })
+
+  it('registers a component, not a pre-built element', async () => {
+    // The host mounts the registered value as a React component and calls its
+    // hooks. An element created eagerly at registration time renders outside the
+    // hook context and comes out empty — the failure this pins.
+    const { remote } = makeRemote()
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const registered = registrations[0]!.render
+    expect(typeof registered).toBe('function')
+    // A component is *called* by the host; an element would already be an object.
+    const page = mount(registered)
+    const tree = await page.start()
+    expect(tree).not.toBeNull()
+    // And it is a real page, not the empty section that a bad registration yields.
+    expect(inputs(tree).length).toBeGreaterThan(0)
+  })
+
+  it('translates the nav label instead of showing the raw key', () => {
+    // A missing dictionary surfaced the literal "settings.nav" in the sidebar.
+    const { remote } = makeRemote()
+    const { ctx, registrations } = makeCtx(remote)
+    registerSettingsPage(ctx as never)
+    const label = (registrations[0]!.descriptor['label'] as () => string)()
+    expect(label).not.toBe('settings.nav')
+    expect(label.length).toBeGreaterThan(0)
   })
 })
 
@@ -243,7 +278,8 @@ describe('settings page behaviour', () => {
     walk(tree, (node) => {
       for (const child of node.children) if (typeof child === 'string') text += child
     })
-    expect(text).toContain('page.unavailable')
+    // The message is translated, so assert on the English text rather than the key.
+    expect(text).toContain(en['page.unavailable'])
   })
 
   it('degrades when the client has no settings remote at all', async () => {

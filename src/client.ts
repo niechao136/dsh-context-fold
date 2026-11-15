@@ -31,7 +31,13 @@
  * @module dsh-context-fold/client
  */
 import { ensurePanelCss } from './panel-css.ts'
-import { ensureSettingsCss, registerSettingsPage, type SettingsPageContext } from './settings-page.ts'
+import {
+  SETTINGS_NS,
+  ensureSettingsCss,
+  registerSettingsPage,
+  settingsDictionaries,
+  type SettingsPageContext,
+} from './settings-page.ts'
 
 /** One fold row as the server reports it. */
 export interface FoldRow {
@@ -595,8 +601,13 @@ export const inject = ['slots', 'locale', 'remote.settings']
 export function apply(ctx: ClientContext): void {
   ensurePanelCss()
 
+  // Two locales: the conversation tab's, and the settings page's. They are
+  // separate namespaces because both surfaces label themselves and a missing
+  // one shows the raw key ("settings.nav") in the sidebar — which is exactly
+  // what happened while only the tab's dictionary was registered.
   const registerDictionaries = (): void => {
     ctx.locale.register(NS, { zh, en })
+    ctx.locale.register(SETTINGS_NS, settingsDictionaries)
   }
   if (typeof ctx.effect === 'function') {
     ctx.effect(registerDictionaries, 'context-fold: dictionaries')

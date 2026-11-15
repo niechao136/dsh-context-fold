@@ -153,7 +153,25 @@ interface SettingsDocument {
 }
 
 /** Locale namespace for this page. */
-const NS = 'contextFold'
+export const SETTINGS_NS = 'contextFoldSettings'
+
+/**
+ * Translate a key through the locale service, falling back to the English
+ * dictionary so a missing binding never renders a raw key.
+ *
+ * @param ctx - client context.
+ * @param key - dictionary key.
+ * @returns the text.
+ */
+function translate(ctx: SettingsPageContext, key: string): string {
+  try {
+    const bound = ctx.locale.bind(SETTINGS_NS)(key)
+    if (typeof bound === 'string' && bound !== '' && bound !== key) return bound
+    return en[key] ?? zh[key] ?? key
+  } catch {
+    return en[key] ?? zh[key] ?? key
+  }
+}
 
 /** Label and control strings. */
 const zh: Record<string, string> = {
@@ -204,45 +222,57 @@ function valueOf(layer: Record<string, unknown> | undefined, key: string): unkno
 /**
  * Build the settings page registration.
  *
+ * The slot expects a **React component**, not a rendered element: the host mounts
+ * it and calls its hooks. `createPage` therefore returns a function component
+ * (which resolves React lazily, inside the render the host controls), never a
+ * pre-built element — an element created at registration time would be rendered
+ * outside React's hook context and come out empty.
+ *
  * @param ctx - client context carrying slots, locale and the remote namespace.
  * @returns the slot disposer, when the host returns one.
  */
 export function registerSettingsPage(ctx: SettingsPageContext): unknown {
+  // The component is module-scoped (so the host sees a stable reference), which
+  // means it cannot close over `ctx`; stash it here for the render pass.
+  pageContext = ctx
   return ctx.slots.inject('settings.section', () =>
     ctx.slots.register(
       {
         name: 'settings.section',
         id: 'context-fold',
-        // After the built-in sections (general 0, plugins 15), before nothing.
+        // After the built-in sections (general 0, plugins 15).
         order: 60,
-        locale: NS,
-        label: () => {
-          try {
-            return ctx.locale.bind(NS)('settings.nav') || zh['settings.nav']
-          } catch {
-            return zh['settings.nav']
-          }
-        },
+        locale: SETTINGS_NS,
+        label: () => translate(ctx, 'settings.nav'),
       },
-      (props: unknown) => createPage(ctx, props),
+      SettingsSection,
     ),
   )
 }
 
+/** The context captured for the module-scoped section component. */
+let pageContext: SettingsPageContext | undefined
+
 /**
- * The page body.
+ * The section component.
  *
- * Kept as a factory so `settings-page.ts` holds no React import of its own; the
- * client bundle passes its `createElement`/hooks in.
+ * Declared at module scope and passed to `slots.register` as a stable component
+ * reference, so the host mounts it once per navigation rather than remounting a
+ * fresh closure each render.
  *
- * @param ctx - client context.
  * @param props - slot props (carries the React runtime seat).
- * @returns the rendered tree.
+ * @returns the rendered section.
  */
-function createPage(ctx: SettingsPageContext, props: unknown): unknown {
-  // The slot injects the React runtime; fall back to the bundle's own require.
-  const react = (props as { react?: ReactSeat } | undefined)?.react ?? requireReact()
-  return renderPage(ctx, react)
+function SettingsSection(props: unknown): unknown {
+  const ctx = pageContext
+  if (ctx === undefined) return null
+  return renderPage(ctx, reactOf(props))
+}
+
+/** Resolve the React runtime from the slot props, falling back to the platform table. */
+function reactOf(props: unknown): ReactSeat {
+  const injected = (props as { react?: ReactSeat } | undefined)?.react
+  return injected ?? requireReact()
 }
 
 /**
@@ -362,13 +392,7 @@ function renderPage(ctx: SettingsPageContext, react: ReactSeat): unknown {
       })
   }
 
-  const t = (key: string): string => {
-    try {
-      return ctx.locale.bind(NS)(key) || en[key] || key
-    } catch {
-      return en[key] ?? key
-    }
-  }
+  const t = (key: string): string => translate(ctx, key)
 
   const header = el(
     'div',
@@ -499,5 +523,5 @@ export function ensureSettingsCss(): void {
   document.head.appendChild(style)
 }
 
-/** Dictionaries this page registers. */
-export const dictionaries = { zh, en }
+/** Dictionaries this page registers, keyed by locale id. */
+export const settingsDictionaries = { zh, en }
