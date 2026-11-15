@@ -265,8 +265,28 @@ let pageContext: SettingsPageContext | undefined
  */
 function SettingsSection(props: unknown): unknown {
   const ctx = pageContext
-  if (ctx === undefined) return null
-  return renderPage(ctx, reactOf(props))
+  // `pageContext` is assigned by `registerSettingsPage` before the host can mount
+  // this component, so this is only a defensive branch.
+  if (ctx === undefined) {
+    const react = reactOf(props)
+    return react.createElement('div', { className: 'cf-set' }, 'context-fold: settings context was released; reload the page.')
+  }
+  try {
+    return renderPage(ctx, reactOf(props))
+  } catch (error) {
+    // The shell wraps every slot entry in an error boundary that renders an empty
+    // anchor on failure, so a thrown error here shows as a blank section with no
+    // message anywhere. Render the failure instead: a visible reason is worth far
+    // more than a clean-looking page.
+    const react = reactOf(props)
+    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+    return react.createElement(
+      'div',
+      { className: 'cf-set' },
+      react.createElement('div', { className: 'cf-set-title' }, translate(ctx, 'page.failed')),
+      react.createElement('pre', { className: 'cf-set-crash' }, message),
+    )
+  }
 }
 
 /** Resolve the React runtime from the slot props, falling back to the platform table. */
@@ -333,35 +353,48 @@ function renderPage(ctx: SettingsPageContext, react: ReactSeat): unknown {
       return
     }
     setState((previous) => ({ ...previous, status: 'loading', busy: false }))
-    void settings.describe().then((response) => {
-      if (!response.ok || response.value === undefined) {
+    void settings.describe().then(
+      (response) => {
+        if (!response.ok || response.value === undefined) {
+          setState({
+            status: 'error',
+            values: {},
+            writable: false,
+            busy: false,
+            message: response.error?.message ?? 'could not read settings',
+          })
+          return
+        }
+        const row = response.value.namespaces.find((candidate) => candidate.ns === ns)
+        if (row === undefined) {
+          setState({ status: 'unavailable', values: {}, writable: false, busy: false })
+          return
+        }
+        const values: Record<string, unknown> = {}
+        for (const field of FIELDS) {
+          const resolved = valueOf(row.value, field.key) ?? valueOf(row.user, field.key)
+          if (resolved !== undefined) values[field.key] = resolved
+        }
+        setState({
+          status: 'ready',
+          values,
+          revision: row.revision,
+          writable: row.writable !== false && response.value.writable !== false,
+          busy: false,
+        })
+      },
+      // A rejected promise used to leave the page stuck on "loading" with no
+      // explanation; surface it as a real error state instead.
+      (error: unknown) => {
         setState({
           status: 'error',
           values: {},
           writable: false,
           busy: false,
-          message: response.error?.message ?? 'could not read settings',
+          message: error instanceof Error ? error.message : String(error),
         })
-        return
-      }
-      const row = response.value.namespaces.find((candidate) => candidate.ns === ns)
-      if (row === undefined) {
-        setState({ status: 'unavailable', values: {}, writable: false, busy: false })
-        return
-      }
-      const values: Record<string, unknown> = {}
-      for (const field of FIELDS) {
-        const resolved = valueOf(row.value, field.key) ?? valueOf(row.user, field.key)
-        if (resolved !== undefined) values[field.key] = resolved
-      }
-      setState({
-        status: 'ready',
-        values,
-        revision: row.revision,
-        writable: row.writable !== false && response.value.writable !== false,
-        busy: false,
-      })
-    })
+      },
+    )
   }
 
   react.useEffect(() => {
@@ -505,6 +538,7 @@ const CSS = `
 .cf-set-btn { border: .5px solid var(--dsw-alias-border-l3, #3a3a40); border-radius: 7px; padding: 5px 12px; font-family: inherit; font-size: 12px; cursor: pointer; background: var(--dsw-alias-bg-layer-2, #202024); color: var(--dsw-alias-label-secondary, #a9a9b2); transition: background-color var(--ds-transition-duration, .2s) var(--ds-ease-in-out, ease-in-out); }
 .cf-set-btn:hover { background: var(--dsw-alias-interactive-bg-hover, #26262c); }
 .cf-set-btn:disabled { opacity: .5; cursor: not-allowed; }
+.cf-set-crash { margin: 8px 0 0; padding: 10px; border-radius: 6px; background: var(--dsw-alias-bg-layer-3, #2a2a30); color: var(--dsw-alias-state-error-primary, #f87171); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
 `
 
 /**
