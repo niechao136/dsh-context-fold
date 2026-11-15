@@ -207,12 +207,14 @@ export function counterfactualOf(
 
   const grossSaving = tokensSavedPerStep * remainingSteps * savedTokenRate
 
-  // One invalidation per fold: every token of the prompt after the fold point is
-  // re-billed from cache-read to uncached once. Modelled per fold over the
-  // prompt size observed at that step.
+  // One invalidation *per distinct fold step*, not per fold. Folds that land in
+  // the same step invalidate the same prefix once: the second fold's rewrite is
+  // already ahead of a prefix that was re-billed moments earlier, so charging
+  // the whole prompt again for it would double-count the same cost.
   let invalidationCost = 0
   if (foldSteps !== undefined) {
-    for (const foldStep of foldSteps) {
+    const distinct = [...new Set(foldSteps)]
+    for (const foldStep of distinct) {
       const at = steps.find((step) => step.step >= foldStep)
       if (at === undefined) continue
       const prompt = promptTokensOf(at)
@@ -236,9 +238,13 @@ export function counterfactualOf(
   if (foldSteps === undefined || foldSteps.length === 0) {
     assumptions.push('Fold step numbers were unavailable, so every observed step is credited with the saving. Treat the figure as an upper bound.')
   } else {
-    assumptions.push(`Each fold is charged one prefix invalidation: the whole prompt after it re-billed from cache-read to uncached once.`)
+    const distinctFoldSteps = new Set(foldSteps).size
+    assumptions.push(
+      `Each of the ${String(distinctFoldSteps)} distinct fold step(s) is charged one prefix invalidation: the prompt after it re-billed from cache-read to uncached once. Folds sharing a step share that charge, because they invalidate the same prefix.`,
+    )
   }
   assumptions.push('The counterfactual assumes the same number of steps and the same cache behaviour as the real session — a folded prompt might have hit cache differently.')
+  assumptions.push('"Saving per step" is the total prompt reduction on the surface, not a per-fold figure: it is multiplied by the steps that followed each fold.')
 
   return {
     tokensNow,

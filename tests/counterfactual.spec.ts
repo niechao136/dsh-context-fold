@@ -82,6 +82,19 @@ describe('counterfactualOf', () => {
     expect(without.invalidationCost).toBe(0)
   })
 
+  it('charges one invalidation per distinct fold step, not per fold', () => {
+    // Two folds landing in the same step rewrite one prefix: they must not be
+    // billed twice for it. A session with 423 folds across 240 steps otherwise
+    // reports a strongly inflated invalidation cost and a fake net loss.
+    const steps = Array.from({ length: 10 }, (_, index) => step({ step: index + 1, input: 1000, cacheRead: 1000 }))
+    const together = counterfactualOf([fold()], steps, { foldSteps: [2, 2] })
+    const once = counterfactualOf([fold()], steps, { foldSteps: [2] })
+    expect(together.invalidationCost).toBe(once.invalidationCost)
+    // Distinct steps still stack.
+    const apart = counterfactualOf([fold()], steps, { foldSteps: [2, 3] })
+    expect(apart.invalidationCost).toBeGreaterThan(once.invalidationCost)
+  })
+
   it('can show a net loss when the fold lands too late to repay its invalidation', () => {
     // One fold, one step left, a huge prompt: the invalidation dwarfs the saving.
     const steps = [step({ step: 1, input: 0, cacheRead: 200000 }), step({ step: 2, input: 0, cacheRead: 200000 })]
