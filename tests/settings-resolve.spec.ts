@@ -16,7 +16,7 @@ describe('resolveConfig against real schema output', () => {
     const fromSchema = Config({}) as unknown as Partial<Record<string, unknown>>
     const resolved = resolveConfig(fromSchema as never)
     expect(resolved.minFoldChars).toBe(1000)
-    expect(resolved.minBatchChars).toBe(8000)
+    expect(resolved.minBatchChars).toBe(16000)
     expect(resolved.keepRecentSteps).toBe(6)
     expect(resolved.staleSteps).toBe(12)
     expect(resolved.batchSpanSteps).toBe(20)

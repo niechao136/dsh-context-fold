@@ -185,8 +185,9 @@ const zh: Record<string, string> = {
   'field.dryRun.hint': '只计算并报告候选，不改动会话。适合在正式调整阈值前先看效果。',
   'field.minFoldChars.label': '工具结果最小长度',
   'field.minFoldChars.hint': '小于该字符数的工具结果不折叠。最低 300 —— 再短的话，标记本身的开销就抵得上被替换的正文了。',
-  'field.minBatchChars.label': '批量最小长度',
-  'field.minBatchChars.hint': '只有当一批候选合计达到该字符数时才折叠。',
+  'field.minBatchChars.label': '统一折叠门槛',
+  'field.minBatchChars.hint':
+    '工具结果与思考过程合计至少要释放这么多字符，任一才会折叠。两者共用同一门槛，因为改动任一处都会让同一段提示词缓存失效，分开判定会让同一步付出两次失效代价。',
   'field.keepRecentSteps.label': '保留最近步数',
   'field.keepRecentSteps.hint': '最近 N 步的结果不折叠：这些内容还在被推理使用。',
   'field.staleSteps.label': '超过多少步算陈旧',
@@ -219,8 +220,9 @@ const en: Record<string, string> = {
   'field.dryRun.hint': 'Compute and report candidates without mutating the session. Useful for judging a threshold change before applying it.',
   'field.minFoldChars.label': 'Minimum tool result size',
   'field.minFoldChars.hint': 'Skip tool results smaller than this many characters. Never below 300 — below that the marker costs as much as the text it replaces.',
-  'field.minBatchChars.label': 'Minimum batch size',
-  'field.minBatchChars.hint': 'Only fold a batch of candidates whose combined size reaches this many characters.',
+  'field.minBatchChars.label': 'Shared fold gate',
+  'field.minBatchChars.hint':
+    'Tool results and reasoning together must free at least this many characters before either folds. They share one gate because any change invalidates the same prompt-cache prefix, so judging them separately made a single step pay twice.',
   'field.keepRecentSteps.label': 'Keep recent steps',
   'field.keepRecentSteps.hint': 'Never fold a result from the newest N steps: those are the ones still being reasoned about.',
   'field.staleSteps.label': 'Stale after',

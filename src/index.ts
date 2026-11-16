@@ -26,9 +26,10 @@ import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import { Config, resolveConfig, type ContextFoldConfig } from './config.ts'
 import { renderReport, reportOf } from './measure.ts'
 import type { FoldBatch } from './plan.ts'
+import { gateFoldPool, type FoldGate } from './plan.ts'
 import { planReasoningFolds, reasoningCandidates, reasoningProjection, recordReasoningFolds } from './reasoning.ts'
 import { registerRoutes, type ConnectionRoutes } from './routes.ts'
-import { foldBatch, planFor, type FoldPassResult } from './session.ts'
+import { evaluateSession, foldBatch, type FoldPassResult } from './session.ts'
 
 export { Config, resolveConfig, DEFAULT_CONFIG } from './config.ts'
 export type { ContextFoldConfig } from './config.ts'
@@ -50,7 +51,7 @@ export { conclude, codePointLength, isFoldableContent, parseSpillNotice, textOf 
 export { planFolds } from './plan.ts'
 export type { FoldBatch, FoldDecision, FoldPlan, NodeSnapshot, SkippedNode } from './plan.ts'
 export type { FoldFacts } from './rules.ts'
-export { planFor, snapshotInput } from './session.ts'
+export { evaluateSession, planFor, snapshotInput } from './session.ts'
 export type { FoldPassResult, FoldedNodeRecord, FoldFailure } from './session.ts'
 export { reportOf, renderReport } from './measure.ts'
 export type { FoldRecord, FoldReport } from './measure.ts'
@@ -156,16 +157,22 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
         }
         return undefined
       }
-      const decision = planFor(session, currentTurn, currentStep, config)
+      const { decision, currentGlobalStep } = evaluateSession(session, currentTurn, currentStep, config)
       const reasoningPlans = config.foldReasoning
-        ? planReasoningFolds(reasoningCandidates(session), currentTurn, currentStep, config)
+        ? planReasoningFolds(reasoningCandidates(session), currentTurn, currentStep, config, currentGlobalStep)
         : []
+      // One gate for both kinds: they invalidate the same prefix, so deciding
+      // separately let a single step pay for two cache misses.
+      const reasoningChars = reasoningPlans.reduce((total, plan) => total + plan.charsRemoved, 0)
+      const gate = gateFoldPool(decision.toolChars, reasoningChars, config)
       if (config.dryRun) {
-        ctx.logger.info(describeDecision('dryRun: would fold', decision, config))
-        if (reasoningPlans.length > 0) {
-          const chars = reasoningPlans.reduce((total, plan) => total + plan.charsRemoved, 0)
-          ctx.logger.info(`dryRun: would fold reasoning in ${reasoningPlans.length} message(s), removing ${chars} chars`)
-        }
+        ctx.logger.info(describeDecision('dryRun: would fold', decision, gate, config))
+        return { decision, folded: [], failed: [], charsRemoved: 0 }
+      }
+      if (!gate.fold) {
+        // Below the shared threshold nothing folds — reasoning included. Doing
+        // half the work still invalidates the whole prefix, so a partial fold
+        // pays the cost without the compensating saving.
         return { decision, folded: [], failed: [], charsRemoved: 0 }
       }
       // Reasoning folding is recorded even when no tool batch qualifies: it is a
@@ -331,19 +338,22 @@ function stepOf(event: { type: string; data: unknown }): number | undefined {
  *
  * @param prefix - leading phrase.
  * @param decision - the decision to describe.
+ * @param gate - the shared pool gate that accepted or rejected this step.
  * @param config - resolved configuration.
  * @returns a single log line.
  */
 export function describeDecision(
   prefix: string,
   decision: { batches: readonly { members: readonly unknown[] }[]; candidateChars: number; skipped: readonly { reason: string }[] },
+  gate: FoldGate,
   config: ContextFoldConfig,
 ): string {
   const nodes = decision.batches.reduce((total, batch) => total + batch.members.length, 0)
   const reasons = new Map<string, number>()
   for (const skip of decision.skipped) reasons.set(skip.reason, (reasons.get(skip.reason) ?? 0) + 1)
   const detail = [...reasons].map(([reason, count]) => `${reason}=${count}`).join(' ')
-  return `context-fold: ${prefix} ${nodes} node(s) in ${decision.batches.length} batch(es); candidate chars ${decision.candidateChars}; skipped ${detail === '' ? 'none' : detail}; thresholds minFoldChars=${config.minFoldChars} minBatchChars=${config.minBatchChars}`
+  const verdict = gate.fold ? 'pass' : 'below threshold'
+  return `context-fold: ${prefix} ${nodes} node(s) in ${decision.batches.length} batch(es); tool chars ${gate.toolChars} + reasoning chars ${gate.reasoningChars} = pool ${gate.poolChars} / ${gate.threshold} (${verdict}); skipped ${detail === '' ? 'none' : detail}; thresholds minFoldChars=${config.minFoldChars} minBatchChars=${config.minBatchChars}`
 }
 
 export default { name, inject, Config, apply }

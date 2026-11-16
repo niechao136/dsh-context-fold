@@ -38,6 +38,7 @@ import type { SpillStore } from '@deepseek-ai/dsh-spill'
 import type { ContextFoldConfig } from './config.ts'
 import { FOLD_MARKER } from './format.ts'
 import { codePointLength } from './rules.ts'
+import { stepOrdinals } from './session.ts'
 
 /** Marker opening a folded reasoning block. Must be distinctive: `startsWith` is the idempotency test. */
 export const REASONING_MARKER = `${FOLD_MARKER} [reasoning]`
@@ -217,8 +218,10 @@ export interface ReasoningCandidate {
   seq: SessionSeq
   /** Turn the message belongs to. */
   turn: number
-  /** Step the message belongs to. */
+  /** Step the message belongs to. Restarts at every turn, so never compare across turns. */
   step: number
+  /** Monotonic step ordinal; defaults to `step` on single-turn snapshots. */
+  globalStep?: number
   /** Current model-visible content. */
   content: readonly ContentBlock[]
 }
@@ -265,6 +268,7 @@ export function planReasoningFolds(
   currentTurn: number,
   currentStep: number,
   config: ContextFoldConfig,
+  currentGlobalStep?: number,
 ): ReasoningPlan[] {
   const plans: ReasoningPlan[] = []
   for (const node of candidates) {
@@ -274,7 +278,10 @@ export function planReasoningFolds(
     if (!isToolCallTurn(node.content) && !config.foldPlainTurnReasoning) continue
     const aged = node.turn < currentTurn || currentStep - node.step >= config.staleSteps
     if (!aged) continue
-    if (node.step > currentStep - config.keepRecentSteps) continue
+    // Recency uses the monotonic ordinal for the same reason `plan.ts` does:
+    // `step` restarts per turn, so a raw subtraction strands messages from any
+    // turn that ran longer than the open one.
+    if ((currentGlobalStep ?? currentStep) - (node.globalStep ?? node.step) < config.keepRecentSteps) continue
     const indexes: number[] = []
     const chars: number[] = []
     let removed = 0
@@ -336,12 +343,20 @@ function freezeCopy<T>(value: T): T {
  */
 export function reasoningCandidates(session: Session): ReasoningCandidate[] {
   const candidates: ReasoningCandidate[] = []
+  // Same ordinal scheme as `snapshotInput`, so both fold kinds agree on "recent".
+  const { globalStepOf } = stepOrdinals(session.snapshotEvents())
   for (const seq of [...session.surface.nodes]) {
     const event = session.eventAt(seq)
     if (event?.type !== 'assistant/message') continue
     const message = session.deriveEventMessage(event)
     if (message === null || message.role !== 'assistant') continue
-    candidates.push({ seq, turn: event.data.turn, step: event.data.step, content: message.content })
+    candidates.push({
+      seq,
+      turn: event.data.turn,
+      step: event.data.step,
+      globalStep: globalStepOf(event.data.turn, event.data.step),
+      content: message.content,
+    })
   }
   return candidates
 }

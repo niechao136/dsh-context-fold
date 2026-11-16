@@ -12,7 +12,15 @@ import z from '@deepseek-ai/schemastery'
 export interface ContextFoldConfig {
   /** Skip results smaller than this many characters. Never below 300 (design §3.4: negative return below that). */
   minFoldChars: number
-  /** Only fold when the candidate batch is worth the one cache invalidation. */
+  /**
+   * Size the shared fold pool must reach before anything folds.
+   *
+   * Tool results and reasoning draw on **one** pool rather than two: any change
+   * to a historical message invalidates the same prompt-cache prefix, so two
+   * independent thresholds would each think their own fold was worth the cost
+   * and pay it twice in the same step. Summing both and gating once means a
+   * step either folds everything eligible or nothing.
+   */
   minBatchChars: number
   /** Never fold the newest N steps. */
   keepRecentSteps: number
@@ -40,7 +48,7 @@ export interface ContextFoldConfig {
 /** Low-friction defaults from design §6.9. */
 export const DEFAULT_CONFIG: Readonly<ContextFoldConfig> = deepFreeze({
   minFoldChars: 1000,
-  minBatchChars: 8000,
+  minBatchChars: 16000,
   keepRecentSteps: 6,
   staleSteps: 12,
   batchSpanSteps: 20,
@@ -77,7 +85,9 @@ export const Config = z
       .step(1)
       .min(1)
       .default(DEFAULT_CONFIG.minBatchChars)
-      .description('Only fold a batch of candidates whose combined size reaches this many characters.')
+      .description(
+        'Shared size gate: tool results and reasoning together must free at least this many characters before either folds. One number because both kinds of change invalidate the same cache prefix.',
+      )
       .volatile(),
     keepRecentSteps: z
       .number()

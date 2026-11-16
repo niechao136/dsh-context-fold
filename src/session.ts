@@ -100,6 +100,38 @@ export function currentNode(session: Session, seq: SessionSeq): CurrentNode | un
   return { event, message, text: textOf(message.content) }
 }
 
+
+/**
+ * Build a monotonic step ordinal for a stream of session events.
+ *
+ * `step` restarts at every turn, so recency cannot subtract raw steps across
+ * turns. Each turn's steps are placed above every earlier turn's, offset by the
+ * longest step count seen in those turns. A node from a turn that ran to step
+ * 116 therefore stays genuinely old when a later turn sits at step 35
+ * (measured: 9 nodes, ~19k chars, were stranded forever before this).
+ *
+ * @param events - the session event stream, in order.
+ * @returns `globalStepOf(turn, step)` and the ordinal just past the last event.
+ */
+export function stepOrdinals(
+  events: readonly { data: unknown }[],
+): { globalStepOf: (turn: number, step: number) => number; endGlobalStep: number } {
+  const maxStepOfTurn = new Map<number, number>()
+  for (const event of events) {
+    const data = event.data as { turn?: unknown; step?: unknown }
+    if (typeof data.turn !== 'number' || typeof data.step !== 'number') continue
+    const known = maxStepOfTurn.get(data.turn)
+    if (known === undefined || data.step > known) maxStepOfTurn.set(data.turn, data.step)
+  }
+  const baseByTurn = new Map<number, number>()
+  let running = 0
+  for (const turn of [...maxStepOfTurn.keys()].sort((a, b) => a - b)) {
+    baseByTurn.set(turn, running)
+    running += (maxStepOfTurn.get(turn) ?? 0) + 1
+  }
+  return { globalStepOf: (turn, step) => (baseByTurn.get(turn) ?? 0) + step, endGlobalStep: running }
+}
+
 /**
  * Build the detached evaluation input for one moment in the session.
  *
@@ -110,12 +142,18 @@ export function currentNode(session: Session, seq: SessionSeq): CurrentNode | un
  * @param session - session to read.
  * @returns a snapshot that does not reference live session objects.
  */
-export function snapshotInput(session: Session): { nodes: NodeSnapshot[]; mentions: MentionRecord[] } {
+export function snapshotInput(
+  session: Session,
+  currentTurn?: number,
+  currentStep?: number,
+): { nodes: NodeSnapshot[]; mentions: MentionRecord[]; currentGlobalStep: number } {
   const nodes: NodeSnapshot[] = []
   const calls = new Map<string, { name: string; args: string }>()
   const mentions: MentionRecord[] = []
+  const events = session.snapshotEvents()
+  const { globalStepOf, endGlobalStep } = stepOrdinals(events)
 
-  for (const event of session.snapshotEvents()) {
+  for (const event of events) {
     switch (event.type) {
       case 'tool/call': {
         calls.set(event.data.callId, { name: event.data.name, args: event.data.arguments })
@@ -154,6 +192,7 @@ export function snapshotInput(session: Session): { nodes: NodeSnapshot[]; mentio
       seq,
       turn: event.data.turn,
       step: event.data.step,
+      globalStep: globalStepOf(event.data.turn, event.data.step),
       toolName: call?.name ?? 'unknown',
       callId: message.toolCallId,
       ...(call === undefined ? {} : { args: call.args }),
@@ -161,7 +200,9 @@ export function snapshotInput(session: Session): { nodes: NodeSnapshot[]; mentio
       isError: message.isError === true,
     })
   }
-  return { nodes, mentions }
+  const currentGlobalStep =
+    currentTurn === undefined || currentStep === undefined ? endGlobalStep : globalStepOf(currentTurn, currentStep)
+  return { nodes, mentions, currentGlobalStep }
 }
 
 /**
@@ -174,8 +215,28 @@ export function snapshotInput(session: Session): { nodes: NodeSnapshot[]; mentio
  * @returns the decision.
  */
 export function planFor(session: Session, currentTurn: number, currentStep: number, config: ContextFoldConfig): FoldDecision {
-  const { nodes, mentions } = snapshotInput(session)
-  return planFolds({ nodes, mentions, currentTurn, currentStep, config })
+  const { nodes, mentions, currentGlobalStep } = snapshotInput(session, currentTurn, currentStep)
+  return planFolds({ nodes, mentions, currentTurn, currentStep, currentGlobalStep, config })
+}
+
+/**
+ * Plan one evaluation and report the monotonic ordinal of the moment being
+ * evaluated, so reasoning folding can apply the same recency rule.
+ *
+ * @param session - session to read.
+ * @param currentTurn - the turn being evaluated.
+ * @param currentStep - the step being evaluated.
+ * @param config - resolved configuration.
+ * @returns the decision plus `currentGlobalStep`.
+ */
+export function evaluateSession(
+  session: Session,
+  currentTurn: number,
+  currentStep: number,
+  config: ContextFoldConfig,
+): { decision: FoldDecision; currentGlobalStep: number } {
+  const { nodes, mentions, currentGlobalStep } = snapshotInput(session, currentTurn, currentStep)
+  return { decision: planFolds({ nodes, mentions, currentTurn, currentStep, currentGlobalStep, config }), currentGlobalStep }
 }
 
 /**

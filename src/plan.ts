@@ -20,8 +20,13 @@ export interface NodeSnapshot {
   seq: SessionSeq
   /** Turn the result belongs to. */
   turn: number
-  /** Step the result belongs to. */
+  /** Step the result belongs to. Restarts at every turn, so never compare across turns. */
   step: number
+  /**
+   * Monotonic step ordinal across the whole session, used only for the
+   * recency rule. Defaults to `step` when the caller does not track turns.
+   */
+  globalStep?: number
   /** Tool name, resolved from the paired `tool/call` when that event is still reachable. */
   toolName: string
   /** Model-issued call id. */
@@ -52,6 +57,11 @@ export interface PlanInput {
   currentTurn: number
   /** Step being evaluated: the step about to run, or the closing step. */
   currentStep: number
+  /**
+   * Monotonic step ordinal of the open turn, for the recency rule.
+   * Defaults to `currentStep` so single-turn snapshots keep their old behaviour.
+   */
+  currentGlobalStep?: number
   /** Resolved configuration. */
   config: ContextFoldConfig
 }
@@ -108,6 +118,44 @@ export interface FoldDecision {
   skipped: readonly SkippedNode[]
   /** Total character count of every candidate that qualified, before batching. */
   candidateChars: number
+  /** Total character count across every batch in `batches`, before the shared pool gate. */
+  toolChars: number
+}
+
+/**
+ * The single gate both fold kinds answer to.
+ *
+ * Tool results and reasoning share **one** pool, because any change to a
+ * historical message invalidates the same prompt-cache prefix. Gating them
+ * separately let each kind decide its own fold was worth a cache miss, so a
+ * single step could pay for two invalidations (measured: 39 of 92 mutating
+ * steps did exactly that). Summing first and deciding once makes a step either
+ * fold everything eligible or nothing.
+ */
+export interface FoldGate {
+  /** Whether this step folds at all. */
+  fold: boolean
+  /** Tool-result characters that would be freed. */
+  toolChars: number
+  /** Reasoning characters that would be freed. */
+  reasoningChars: number
+  /** `toolChars + reasoningChars`. */
+  poolChars: number
+  /** The threshold the pool had to reach. */
+  threshold: number
+}
+
+/**
+ * Decide whether the combined pool justifies one cache invalidation.
+ *
+ * @param toolChars - characters the planned tool batches would free.
+ * @param reasoningChars - characters the planned reasoning folds would free.
+ * @param config - resolved configuration.
+ * @returns the gate, including the numbers it decided on.
+ */
+export function gateFoldPool(toolChars: number, reasoningChars: number, config: ContextFoldConfig): FoldGate {
+  const poolChars = toolChars + reasoningChars
+  return { fold: poolChars >= config.minBatchChars, toolChars, reasoningChars, poolChars, threshold: config.minBatchChars }
 }
 
 /**
@@ -118,6 +166,11 @@ export interface FoldDecision {
  * fold, nodes still cited by a later event never fold, and a node folds only
  * when it is at least `minFoldChars` and a conclusion exists that is smaller
  * than the result.
+ *
+ * This function deliberately does **not** apply `minBatchChars`. That budget is
+ * shared with reasoning folding and is applied once, over both kinds, by
+ * {@link gateFoldPool} — see the note there for why a per-kind threshold was
+ * wrong.
  *
  * @param input - one detached snapshot plus configuration.
  * @returns the decision; an empty `batches` array means "do nothing".
@@ -150,7 +203,13 @@ export function planFolds(input: PlanInput): FoldDecision {
       skip('alive')
       continue
     }
-    if (node.step > input.currentStep - config.keepRecentSteps) {
+    // Recency is measured on a monotonic ordinal, not on `step`: `step` restarts
+    // at every turn boundary, so `currentStep - node.step` compares numbers from
+    // different scales. A node from a turn that ran to step 116 was permanently
+    // "recent" whenever the open turn sat at step 35 (measured: 9 nodes, ~19k
+    // chars, unable to ever fold). Callers supply `globalStep`; it defaults to
+    // `step` so a single-turn snapshot still behaves exactly as before.
+    if ((input.currentGlobalStep ?? input.currentStep) - (node.globalStep ?? node.step) < config.keepRecentSteps) {
       skip('recent')
       continue
     }
@@ -173,7 +232,6 @@ export function planFolds(input: PlanInput): FoldDecision {
   const batches: FoldBatch[] = []
   for (const group of groupByBatch(candidates, config.batchSpanSteps)) {
     const chars = group.reduce((total, node) => total + codePointLength(textOfContent(node.content)), 0)
-    if (chars < config.minBatchChars) continue
     const ordered = [...group].sort((a, b) => {
       const size = codePointLength(textOfContent(b.content)) - codePointLength(textOfContent(a.content))
       return size !== 0 ? size : a.seq - b.seq
@@ -196,7 +254,7 @@ export function planFolds(input: PlanInput): FoldDecision {
       chars,
     })
   }
-  return { batches, skipped, candidateChars }
+  return { batches, skipped, candidateChars, toolChars: candidateChars }
 }
 
 /** Detect a node that a later event still cites (design §6.2). */

@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { DEFAULT_CONFIG, resolveConfig } from '../src/config.ts'
+import { DEFAULT_CONFIG, resolveConfig, type ContextFoldConfig } from '../src/config.ts'
 import { FOLD_MARKER } from '../src/format.ts'
-import { planFolds, type MentionRecord, type NodeSnapshot } from '../src/plan.ts'
+import { gateFoldPool, planFolds, type MentionRecord, type NodeSnapshot } from '../src/plan.ts'
 
 const text = (value: string): ContentBlock[] => [{ type: 'text', text: value }]
 
@@ -60,6 +60,40 @@ describe('planFolds — candidate rules', () => {
     expect(decision.batches).toHaveLength(1)
   })
 
+  it('does not strand a node from a turn that ran longer than the current one', () => {
+    // Steps restart at every turn boundary. Turn 9 ran to step 116, turn 11 is
+    // only at step 35, so `35 - 6 = 29` would mark the turn-9 node "recent"
+    // forever. Recency is measured on the monotonic ordinal instead.
+    const config = resolveConfig({ minBatchChars: 100, keepRecentSteps: 6, staleSteps: 12 })
+    const decision = planFolds({
+      nodes: [node({ seq: 3, turn: 9, step: 111, globalStep: 200 } as never)],
+      mentions: [],
+      currentTurn: 11,
+      currentStep: 35,
+      currentGlobalStep: 300,
+      config,
+    })
+    expect(decision.batches).toHaveLength(1)
+    expect(decision.skipped).toHaveLength(0)
+  })
+
+  it('still refuses a node that really is recent', () => {
+    // Within one turn a stale node (>= staleSteps away) is necessarily far
+    // outside keepRecentSteps, so "recent" now only bites across turns — which
+    // is the case that matters: the previous turn's tail must still be protected.
+    const config = resolveConfig({ minBatchChars: 100, keepRecentSteps: 6, staleSteps: 12 })
+    const decision = planFolds({
+      nodes: [node({ seq: 3, turn: 10, step: 20, globalStep: 296 } as never)],
+      mentions: [],
+      currentTurn: 11,
+      currentStep: 35,
+      currentGlobalStep: 300,
+      config,
+    })
+    expect(decision.batches).toHaveLength(0)
+    expect(decision.skipped[0]!.reason).toBe('recent')
+  })
+
   it('skips a result smaller than minFoldChars', () => {
     const decision = decide([node({ seq: 3, content: text('tiny') })])
     expect(decision.batches).toHaveLength(0)
@@ -91,7 +125,9 @@ describe('planFolds — candidate rules', () => {
     expect(decision.batches).toHaveLength(1)
   })
 
-  it('does not fold when a batch is below minBatchChars', () => {
+  it('leaves the shared pool gate to gateFoldPool, not to the per-batch check', () => {
+    // minBatchChars is shared with reasoning, so planFolds must not apply it —
+    // a small tool batch still becomes a batch, and the single gate decides.
     const strict = resolveConfig({ minBatchChars: 1_000_000 })
     const decision = planFolds({
       nodes: [node({ seq: 3 })],
@@ -100,8 +136,42 @@ describe('planFolds — candidate rules', () => {
       currentStep: 30,
       config: strict,
     })
-    expect(decision.batches).toHaveLength(0)
-    expect(decision.candidateChars).toBeGreaterThan(0)
+    expect(decision.batches).toHaveLength(1)
+    expect(decision.toolChars).toBeGreaterThan(0)
+    expect(gateFoldPool(decision.toolChars, 0, strict).fold).toBe(false)
+  })
+})
+
+describe('gateFoldPool — one gate for both fold kinds', () => {
+  /** Enough combined characters to clear the default 16k gate. */
+  const halves = (config: ContextFoldConfig, tool: number, reasoning: number) => gateFoldPool(tool, reasoning, config)
+
+  it('counts tool and reasoning characters into one pool', () => {
+    const config = resolveConfig({ minBatchChars: 16_000 })
+    expect(halves(config, 8_000, 8_000).fold).toBe(true)
+    expect(halves(config, 8_000, 8_000).poolChars).toBe(16_000)
+  })
+
+  it('refuses when neither kind alone nor together reach the threshold', () => {
+    // This is the case the old per-kind thresholds got wrong: each half alone
+    // is under 16k, so neither would have folded, yet both invalidate the same
+    // prefix and together they clear it.
+    const config = resolveConfig({ minBatchChars: 16_000 })
+    const gate = halves(config, 6_000, 6_000)
+    expect(gate.fold).toBe(false)
+    expect(gate.poolChars).toBe(12_000)
+  })
+
+  it('folds reasoning alone when it alone clears the pool', () => {
+    const config = resolveConfig({ minBatchChars: 16_000 })
+    const gate = halves(config, 0, 16_000)
+    expect(gate.fold).toBe(true)
+    expect(gate.toolChars).toBe(0)
+  })
+
+  it('reports the threshold it compared against', () => {
+    const config = resolveConfig({ minBatchChars: 20_000 })
+    expect(halves(config, 1, 2).threshold).toBe(20_000)
   })
 })
 

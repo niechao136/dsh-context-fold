@@ -12,6 +12,7 @@ import { SpillLocator, type SaveTextSpill, type SpillRef, type SpillStore } from
 import { apply, describeDecision } from '../src/index.ts'
 import { resolveConfig } from '../src/config.ts'
 import { FOLD_MARKER } from '../src/format.ts'
+import { gateFoldPool } from '../src/plan.ts'
 import { reportOf } from '../src/measure.ts'
 
 const text = (value: string): ContentBlock[] => [{ type: 'text', text: value }]
@@ -257,16 +258,22 @@ describe('apply', () => {
 })
 
 describe('describeDecision', () => {
-  it('summarizes batches, candidates, and skip reasons', () => {
+  it('summarizes batches, pool gate, and skip reasons', () => {
     const line = describeDecision('would fold', {
       batches: [{ members: [{}, {}] }, { members: [{}] }],
       candidateChars: 12345,
       skipped: [{ reason: 'recent' }, { reason: 'recent' }, { reason: 'error' }],
-    }, config)
+    }, gateFoldPool(12345, 500, config), config)
     expect(line).toContain('would fold 3 node(s) in 2 batch(es)')
-    expect(line).toContain('candidate chars 12345')
+    expect(line).toContain('pool 12845 /')
     expect(line).toContain('recent=2')
     expect(line).toContain('error=1')
+  })
+
+  it('says so when the combined pool falls short', () => {
+    const strict = resolveConfig({ minBatchChars: 1_000_000 })
+    const line = describeDecision('would fold', { batches: [], candidateChars: 100, skipped: [] }, gateFoldPool(100, 0, strict), strict)
+    expect(line).toContain('below threshold')
   })
 })
 

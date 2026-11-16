@@ -5,7 +5,7 @@ describe('resolveConfig', () => {
   it('returns the documented defaults', () => {
     expect(resolveConfig()).toEqual(DEFAULT_CONFIG)
     expect(resolveConfig({}).minFoldChars).toBe(1000)
-    expect(resolveConfig({}).minBatchChars).toBe(8000)
+    expect(resolveConfig({}).minBatchChars).toBe(16000)
     expect(resolveConfig({}).keepRecentSteps).toBe(6)
     expect(resolveConfig({}).staleSteps).toBe(12)
     expect(resolveConfig({}).batchSpanSteps).toBe(20)
@@ -27,7 +27,7 @@ describe('resolveConfig', () => {
   it('accepts partial overrides and keeps the rest', () => {
     const config = resolveConfig({ minFoldChars: 500 })
     expect(config.minFoldChars).toBe(500)
-    expect(config.minBatchChars).toBe(8000)
+    expect(config.minBatchChars).toBe(16000)
   })
 
   it('freezes the result', () => {
