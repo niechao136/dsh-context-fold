@@ -9,7 +9,7 @@ import { Session, deriveEventMessage, foldSurface, type SessionSeq } from '@deep
 import { SpillLocator, type SaveTextSpill, type SpillRef, type SpillStore } from '@deepseek-ai/dsh-spill'
 import { resolveConfig, type ContextFoldConfig } from '../src/config.ts'
 import { FOLD_MARKER } from '../src/format.ts'
-import { reportOf } from '../src/measure.ts'
+import { isValidLocator, reportOf } from '../src/measure.ts'
 import { foldBatch, planFor, snapshotInput, type FoldHost } from '../src/session.ts'
 
 /** In-memory stand-in for the spill service, which counts writes and can fail on demand. */
@@ -292,6 +292,18 @@ describe('reportOf', () => {
     expect(after.reReads).toBeGreaterThan(before.reReads)
     expect(after.rereadNodes).toBe(1)
   })
+
+  it('rejects truncated locators that would match nearly every event', () => {
+    // A truncated marker left `Full result: '` — a lone quote. Searching for
+    // that matched 193 later events from a single node. Real locators are long
+    // file paths; a one-character quote must never become a search needle.
+    expect(isValidLocator("'")).toBe(false)
+    expect(isValidLocator('x')).toBe(false)
+    expect(isValidLocator('SPEC-v2.md')).toBe(false) // no separator
+    expect(isValidLocator('C:\\repo\\SPEC-v2.md')).toBe(true)
+    expect(isValidLocator('/tmp/dsh-spill/abc-tool-42.txt')).toBe(true)
+  })
+
 
   it('reports nothing for an unfurled session', () => {
     const session = freshSession()

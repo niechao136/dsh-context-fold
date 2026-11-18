@@ -144,33 +144,56 @@ function reasoningFoldsOf(session: Session, events: readonly SessionEvent[]): Re
 }
 
 /**
- * Count later tool calls that cite a folded node.
+ * Count later events that re-read a folded node's content.
  *
- * Two signals, both cheap substring tests over a bounded window: the node's
- * call id, and its spill locator. Design §6.2 records the known limitation — a
- * model that re-runs the original tool with identical arguments is not
- * detected here; the argument-hash refinement is out of phase 1.
+ * Two cheap substring signals over the later event stream:
+ *   1. the batch-head call id (the model citing the fold explicitly), and
+ *   2. a *valid* spill locator (the model reading the spilled original).
+ *
+ * Locator validation matters: a truncated marker can leave `Full result: '`
+ * with a one-character locator, and searching for `'` matches nearly every
+ * later event — producing hundreds of phantom re-reads from a single node.
+ * A real spill locator is both long and path-shaped.
+ *
+ * Deliberately NOT detected: re-running the original tool with the same
+ * arguments (design §6.2's known limitation). The only reliable needle for
+ * that would be a full file path lifted from the conclusion, but conclusions
+ * often quote directories, which match every later operation under them and
+ * create worse false positives than the ones this fix removes.
  *
  * @param events - the session's event log.
  * @param seq - the folded node's seq.
- * @param text - the folded node's text, source of the spill locator.
+ * @param text - the folded node's text, source of call id and locator.
  * @returns the number of later citing events.
  */
 function countReReads(events: readonly SessionEvent[], seq: number, text: string): number {
-  const headCallId = /Batch head: (\S+) \(callId\)/.exec(text)?.[1]
-  const locator = /^Full result: (.+)$/m.exec(text)?.[1]
   const needles: string[] = []
-  if (headCallId !== undefined) needles.push(headCallId)
-  if (locator !== undefined) needles.push(locator.trim())
-  if (needles.length === 0) return 0
+  const headCallId = /Batch head: (\S+) \(callId\)/.exec(text)?.[1]
+  if (headCallId !== undefined && headCallId.length >= 6) needles.push(headCallId)
+
+  const locator = /^Full result: (.+)$/m.exec(text)?.[1]?.trim()
+  if (locator !== undefined && isValidLocator(locator)) needles.push(locator)
+
+  const unique = [...new Set(needles)]
+  if (unique.length === 0) return 0
   let count = 0
   for (const event of events) {
     if (event.seq <= seq) continue
     const searched = searchableText(event)
     if (searched === undefined) continue
-    if (needles.some((needle) => searched.includes(needle))) count++
+    if (unique.some((needle) => searched.includes(needle))) count++
   }
   return count
+}
+
+/**
+ * A spill locator is a real file path, not a truncated fragment.
+ *
+ * @param locator - trimmed locator text from the fold marker.
+ * @returns true when safe to use as a search needle.
+ */
+export function isValidLocator(locator: string): boolean {
+  return locator.length >= 10 && /[\\/]/.test(locator)
 }
 
 /** Text one later event contributes to the re-read search. */
