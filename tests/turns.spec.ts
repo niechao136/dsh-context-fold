@@ -46,8 +46,12 @@ describe('writeTargetPath', () => {
     expect(writeTargetPath('write', JSON.stringify({ file_path: 'C:\\Repo\\A.ts' }))).toBe('c:/repo/a.ts')
     expect(writeTargetPath('ops_write_file', JSON.stringify({ path: '/repo/b.ts' }))).toBe('/repo/b.ts')
   })
-  it('ignores non-write tools and invalid args', () => {
-    expect(writeTargetPath('edit', JSON.stringify({ file_path: 'C:\\repo\\a.ts' }))).toBeUndefined()
+  it('recognizes edit paths too', () => {
+    expect(writeTargetPath('edit', JSON.stringify({ file_path: 'C:\\Repo\\A.ts' }))).toBe('c:/repo/a.ts')
+    expect(writeTargetPath('ops_edit_file', JSON.stringify({ path: '/repo/b.ts' }))).toBe('/repo/b.ts')
+  })
+  it('ignores non-mutating tools and invalid args', () => {
+    expect(writeTargetPath('read', JSON.stringify({ file_path: 'C:\\repo\\a.ts' }))).toBeUndefined()
     expect(writeTargetPath('write', 'not json')).toBeUndefined()
     expect(writeTargetPath('write', JSON.stringify({ file_path: 'x' }))).toBeUndefined()
   })
@@ -68,6 +72,27 @@ describe('planArgFolds (scheme B)', () => {
     const { session } = writeSession()
     const plans = planArgFolds(session, resolveConfig({ minFoldArgsChars: 5000 }))
     expect(plans).toHaveLength(0)
+  })
+
+  it('folds superseded edits, including a write followed by an edit', () => {
+    const session = Session.create('turns-edit' as never)
+    const append = (seqKey: string, name: string, args: string) => {
+      const msg = createAssistantMessage({
+        content: [{ type: 'tool-call', id: seqKey as never, name, arguments: args }],
+        source: { provider: 'test', model: 'test' },
+      })
+      return session.append('assistant/message', { turn: 1, step: 1, message: msg, stream: [] }, { surfaceOp: 'append' }).seq as number
+    }
+    // a.ts: write, then two edits — only the last edit keeps full args.
+    const s1 = append('w', 'write', JSON.stringify({ file_path: 'C:\\repo\\a.ts', content: 'x'.repeat(800) }))
+    append('e1', 'edit', JSON.stringify({ file_path: 'C:\\repo\\a.ts', old: 'x', new: 'y', body: 'y'.repeat(600) }))
+    append('e2', 'edit', JSON.stringify({ file_path: 'C:\\repo\\a.ts', old: 'y', new: 'z', body: 'z'.repeat(600) }))
+    // b.ts: a single edit, never superseded -> stays whole.
+    append('e3', 'edit', JSON.stringify({ file_path: 'C:\\repo\\b.ts', body: 'q'.repeat(700) }))
+
+    const plans = planArgFolds(session, resolveConfig({ minFoldArgsChars: 400 }))
+    // s1 (old write) and e1 (old edit) fold; e2 and b.ts's edit stay.
+    expect(plans.map((p) => p.seq).sort((a, b) => a - b)).toEqual([s1, s1 + 1].sort((a, b) => a - b))
   })
 })
 

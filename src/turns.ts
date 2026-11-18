@@ -103,19 +103,21 @@ export interface TurnPlanResult {
 }
 
 /**
- * Extract a target path from a write-style tool call.
+ * Extract a target path from a file-mutating tool call.
  *
- * Only `write`-like tools are considered: an `edit` argument is a delta and a
- * shell command is transient, so their text is not reconstructible from the
- * current file and must not be treated as "dead" merely because the path was
- * touched again.
+ * Both whole-file writes and incremental edits are considered.  An edit's
+ * arguments are a delta that is not reconstructible from the final file on its
+ * own — but once the *same path* has been mutated again, the earlier delta is
+ * dead information in this conversation: the model will re-read the current
+ * file, not replay an obsolete patch.  Shell commands remain excluded: their
+ * arguments are not anchored to a path and can stay relevant indefinitely.
  *
  * @param name - tool name.
  * @param args - raw JSON argument string.
  * @returns the normalized path, or undefined.
  */
 export function writeTargetPath(name: string, args: string): string | undefined {
-  if (!/^(write|ops_write_file|rw_write_file|wsl-write)$/.test(name)) return undefined
+  if (!/^(write|ops_write_file|rw_write_file|wsl-write|edit|ops_edit_file|wsl-edit)$/.test(name)) return undefined
   let parsed: unknown
   try {
     parsed = JSON.parse(args)
