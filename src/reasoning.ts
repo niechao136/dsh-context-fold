@@ -189,12 +189,14 @@ export function isToolCallTurn(content: readonly ContentBlock[]): boolean {
  *
  * @param text - original reasoning text.
  * @param locator - spill path holding the full original, when one was written.
+ * @param minChars - minimum size to fold; defaults to the historical 900. Callers
+ *   pass `config.minFoldReasoningChars` so the threshold is user-configurable.
  * @returns folded text, or undefined when folding would not shorten it.
  */
-export function foldReasoningText(text: string, locator?: string): string | undefined {
+export function foldReasoningText(text: string, locator?: string, minChars = MIN_REASONING_CHARS): string | undefined {
   if (isFoldedReasoning(text)) return undefined
   const chars = codePointLength(text)
-  if (chars < MIN_REASONING_CHARS) return undefined
+  if (chars < minChars) return undefined
   const head = Array.from(text).slice(0, HEAD_CHARS).join('').trimEnd()
   const omitted = `[… ${formatNumber(chars - codePointLength(head))} chars of earlier reasoning omitted]`
   const folded = [
@@ -287,7 +289,7 @@ export function planReasoningFolds(
     let removed = 0
     for (const [index, block] of node.content.entries()) {
       if (block.type !== 'reasoning') continue
-      const folded = foldReasoningText(block.text)
+      const folded = foldReasoningText(block.text, undefined, config.minFoldReasoningChars)
       if (folded === undefined) continue
       indexes.push(index)
       chars.push(codePointLength(block.text))

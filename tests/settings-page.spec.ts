@@ -246,8 +246,8 @@ describe('settings page behaviour', () => {
     registerSettingsPage(ctx as never)
     const page = mountSection(registrations[0]!)
     const tree = await page.start()
-    // 9 knobs: 2 booleans early, then numbers, then 2 booleans.
-    expect(inputs(tree).length).toBe(9)
+    // 13 knobs: base numbers, reasoning/args thresholds, turn archive, and toggles.
+    expect(inputs(tree).length).toBe(13)
   })
 
   it('reads the effective values from the namespace view', async () => {

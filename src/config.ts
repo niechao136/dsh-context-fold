@@ -30,6 +30,22 @@ export interface ContextFoldConfig {
   batchSpanSteps: number
   /** Fold reasoning blocks on historical tool-call turns (phase 2). */
   foldReasoning: boolean
+  /** Minimum size of a reasoning block before it is a fold candidate. */
+  minFoldReasoningChars: number
+  /** Minimum size of a tool-call argument before it is a fold candidate. */
+  minFoldArgsChars: number
+  /**
+   * Keep the newest N turns fully unfolded; older turns are archived.
+   *
+   * Turn archive is orthogonal to the char-based gate: once a turn crosses
+   * this boundary its tool calls, results and reasoning are archived into a
+   * per-turn spill file, keeping only the assistant/user text in view.
+   */
+  keepRecentTurns: number
+  /** Master switch for turn archiving. */
+  foldTurnArchive: boolean
+  /** Directory (under the spill root) where per-turn archives are written. */
+  turnArchiveDir: string
   /**
    * Also fold reasoning on plain (non-tool-call) turns.
    *
@@ -53,6 +69,11 @@ export const DEFAULT_CONFIG: Readonly<ContextFoldConfig> = deepFreeze({
   staleSteps: 12,
   batchSpanSteps: 20,
   foldReasoning: true,
+  minFoldReasoningChars: 900,
+  minFoldArgsChars: 400,
+  keepRecentTurns: 5,
+  foldTurnArchive: true,
+  turnArchiveDir: 'turns',
   foldPlainTurnReasoning: false,
   enabled: true,
   dryRun: false,
@@ -116,6 +137,37 @@ export const Config = z
       .description(
         'Fold reasoning blocks on historical tool-call turns. Reasoning on plain turns is never re-sent, so it is not folded.',
       )
+      .volatile(),
+    minFoldReasoningChars: z
+      .number()
+      .step(1)
+      .min(0)
+      .default(DEFAULT_CONFIG.minFoldReasoningChars)
+      .description('Skip reasoning blocks smaller than this many characters.')
+      .volatile(),
+    minFoldArgsChars: z
+      .number()
+      .step(1)
+      .min(0)
+      .default(DEFAULT_CONFIG.minFoldArgsChars)
+      .description('Skip tool-call arguments smaller than this many characters.')
+      .volatile(),
+    keepRecentTurns: z
+      .number()
+      .step(1)
+      .min(1)
+      .default(DEFAULT_CONFIG.keepRecentTurns)
+      .description('Keep the newest N turns unfolded. Older turns have their tool calls, results and reasoning archived.')
+      .volatile(),
+    foldTurnArchive: z
+      .boolean()
+      .default(DEFAULT_CONFIG.foldTurnArchive)
+      .description('Archive tool calls, results and reasoning of turns older than keepRecentTurns into per-turn spill files.')
+      .volatile(),
+    turnArchiveDir: z
+      .string()
+      .default(DEFAULT_CONFIG.turnArchiveDir)
+      .description('Directory under the spill root where per-turn archive files are written.')
       .volatile(),
     foldPlainTurnReasoning: z
       .boolean()
@@ -181,13 +233,21 @@ export function resolveConfig(config: Partial<ContextFoldConfig> = {}): ContextF
     staleSteps: readField(raw['staleSteps'], DEFAULT_CONFIG.staleSteps),
     batchSpanSteps: readField(raw['batchSpanSteps'], DEFAULT_CONFIG.batchSpanSteps),
     foldReasoning: readField(raw['foldReasoning'], DEFAULT_CONFIG.foldReasoning),
+    minFoldReasoningChars: readField(raw['minFoldReasoningChars'], DEFAULT_CONFIG.minFoldReasoningChars),
+    minFoldArgsChars: readField(raw['minFoldArgsChars'], DEFAULT_CONFIG.minFoldArgsChars),
+    keepRecentTurns: readField(raw['keepRecentTurns'], DEFAULT_CONFIG.keepRecentTurns),
+    foldTurnArchive: readField(raw['foldTurnArchive'], DEFAULT_CONFIG.foldTurnArchive),
+    turnArchiveDir: readField(raw['turnArchiveDir'], DEFAULT_CONFIG.turnArchiveDir),
     foldPlainTurnReasoning: readField(raw['foldPlainTurnReasoning'], DEFAULT_CONFIG.foldPlainTurnReasoning),
     enabled: readField(raw['enabled'], DEFAULT_CONFIG.enabled),
     dryRun: readField(raw['dryRun'], DEFAULT_CONFIG.dryRun),
   }
+  const nonIntegerKeys = new Set([
+    'enabled', 'dryRun', 'foldReasoning', 'foldPlainTurnReasoning', 'foldTurnArchive', 'turnArchiveDir',
+  ])
   for (const [key, value] of Object.entries(resolved)) {
-    if (key === 'enabled' || key === 'dryRun' || key === 'foldReasoning' || key === 'foldPlainTurnReasoning') continue
-    assertInteger(key, value, key === 'minFoldChars' ? 300 : key === 'minBatchChars' ? 1 : 0)
+    if (nonIntegerKeys.has(key)) continue
+    assertInteger(key, value as number, key === 'minFoldChars' ? 300 : key === 'minBatchChars' ? 1 : 0)
   }
   if (resolved.staleSteps < 1) throw new Error(`context-fold: staleSteps (${resolved.staleSteps}) must be at least 1`)
   if (resolved.batchSpanSteps < 1) throw new Error(`context-fold: batchSpanSteps (${resolved.batchSpanSteps}) must be at least 1`)
