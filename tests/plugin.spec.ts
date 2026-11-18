@@ -324,22 +324,25 @@ describe('reasoning folding is wired through the plugin', () => {
     // `apply()` as a throw: the first registration is already live and correct.
     const fake = fakeContext(services().map)
     let registered = 0
+    const seen = new Set<string>()
     const scope = {
       commands: { register: () => () => {} },
       sessions: {
-        registerMessageProjection() {
+        registerMessageProjection(projection: { type: string }) {
           registered += 1
-          if (registered > 1) throw new Error('session message projection "context-fold/reasoning" is already registered')
+          // Real host rejects a duplicate *type*, not the second registration.
+          if (seen.has(projection.type)) throw new Error(`session message projection "${projection.type}" is already registered`)
+          seen.add(projection.type)
           return async () => {}
         },
       },
     }
     ;(fake.ctx as unknown as { inject: (names: string[], cb: (s: unknown) => void) => void }).inject = (_names, callback) => callback(scope)
     expect(() => apply(fake.ctx, config)).not.toThrow()
-    expect(registered).toBe(1)
+    // Two projections are registered now: reasoning and turn.
+    expect(registered).toBe(2)
     // A second mount hits the duplicate and must warn, not throw.
     expect(() => apply(fake.ctx, config)).not.toThrow()
-    expect(registered).toBe(2)
     expect(fake.logs.some((line) => line.includes('already registered'))).toBe(true)
   })
 

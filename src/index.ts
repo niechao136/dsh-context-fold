@@ -30,6 +30,12 @@ import { gateFoldPool, type FoldGate } from './plan.ts'
 import { planReasoningFolds, reasoningCandidates, reasoningProjection, recordReasoningFolds } from './reasoning.ts'
 import { registerRoutes, type ConnectionRoutes } from './routes.ts'
 import { evaluateSession, foldBatch, type FoldPassResult } from './session.ts'
+import {
+  planArgFolds,
+  planTurnArchives,
+  recordTurnFolds,
+  turnProjection,
+} from './turns.ts'
 
 export { Config, resolveConfig, DEFAULT_CONFIG } from './config.ts'
 export type { ContextFoldConfig } from './config.ts'
@@ -55,6 +61,20 @@ export { evaluateSession, planFor, snapshotInput } from './session.ts'
 export type { FoldPassResult, FoldedNodeRecord, FoldFailure } from './session.ts'
 export { reportOf, renderReport } from './measure.ts'
 export type { FoldRecord, FoldReport } from './measure.ts'
+export {
+  ARG_MARKER,
+  TURN_ARCHIVED,
+  TURN_EVENT,
+  TURN_POINTER,
+  isArchivedTurn,
+  planArgFolds,
+  planTurnArchives,
+  projectTurnMessage,
+  recordTurnFolds,
+  turnProjection,
+  writeTargetPath,
+} from './turns.ts'
+export type { ArgFoldTarget, TurnArchiveTarget, TurnFoldData, TurnPlan, TurnPlanResult } from './turns.ts'
 
 /** Cordis plugin identity. */
 export const name = 'context-fold'
@@ -161,19 +181,38 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
       const reasoningPlans = config.foldReasoning
         ? planReasoningFolds(reasoningCandidates(session), currentTurn, currentStep, config, currentGlobalStep)
         : []
-      // One gate for both kinds: they invalidate the same prefix, so deciding
-      // separately let a single step pay for two cache misses.
+      const argPlans = planArgFolds(session, config)
+      const turnPlans = planTurnArchives(session, currentTurn, config)
+
+      // A turn crossing the archive boundary invalidates the cache regardless:
+      // fold everything pending now (arg folds, reasoning, tool results) and
+      // skip the char gate. One invalidation, maximal work.
+      const archiving = turnPlans.length > 0
+      const argChars = argPlans.reduce((total, plan) => total + plan.chars.reduce((a, b) => a + b, 0), 0)
       const reasoningChars = reasoningPlans.reduce((total, plan) => total + plan.charsRemoved, 0)
-      const gate = gateFoldPool(decision.toolChars, reasoningChars, config)
+      const gate = gateFoldPool(decision.toolChars, reasoningChars + argChars, config)
+      const shouldFold = archiving || gate.fold
       if (config.dryRun) {
         ctx.logger.info(describeDecision('dryRun: would fold', decision, gate, config))
+        if (archiving) ctx.logger.info(`context-fold: dryRun: would archive ${turnPlans.length} turn(s), fold ${argPlans.length} arg group(s)`)
         return { decision, folded: [], failed: [], charsRemoved: 0 }
       }
-      if (!gate.fold) {
-        // Below the shared threshold nothing folds — reasoning included. Doing
-        // half the work still invalidates the whole prefix, so a partial fold
-        // pays the cost without the compensating saving.
+      if (!shouldFold) {
+        // Below the shared threshold nothing folds — reasoning and args included.
+        // Doing half the work still invalidates the whole prefix.
         return { decision, folded: [], failed: [], charsRemoved: 0 }
+      }
+      // Record turn/argument folds (pure projections). Do this before the tool
+      // batches so a single step's invalidation covers all of them at once.
+      if (turnPlans.length > 0 || argPlans.length > 0) {
+        try {
+          const recordSeq = await recordTurnFolds(session, { args: argPlans, turns: turnPlans }, spillStore, config)
+          if (recordSeq !== undefined) {
+            ctx.logger.info(`context-fold: archived ${turnPlans.length} turn(s), folded ${argPlans.length} arg group(s)`)
+          }
+        } catch (error) {
+          ctx.logger.warn(`context-fold: turn archive failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
       }
       // Reasoning folding is recorded even when no tool batch qualifies: it is a
       // pure projection with no spill write and no surface rewrite, so it has no
@@ -249,7 +288,7 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
   ctx.inject(['sessions'], (scope) => {
     const sessions = (scope as unknown as { sessions?: { registerMessageProjection(projection: unknown): () => Promise<void> } }).sessions
     if (sessions === undefined || typeof sessions.registerMessageProjection !== 'function') {
-      ctx.logger.warn('context-fold: no ctx.sessions.registerMessageProjection; reasoning folds stay inactive')
+      ctx.logger.warn('context-fold: no ctx.sessions.registerMessageProjection; reasoning/turn folds stay inactive')
       return
     }
     try {
@@ -257,12 +296,13 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
       // cannot express a plugin-record carrier; the runtime accepts any event
       // type (see the reasoning module header).
       sessions.registerMessageProjection(reasoningProjection)
+      sessions.registerMessageProjection(turnProjection)
       // Say so out loud. A missing projection is invisible from the outside:
       // `deriveEventMessage` ignores a plugin event it has no projection for, so
       // records are written, the tab counts them, and nothing is folded. Without
       // this line the only symptom is "folding looks like it does nothing" —
       // exactly the failure that took a full log dig to find once.
-      ctx.logger.info('context-fold: reasoning projection registered')
+      ctx.logger.info('context-fold: reasoning + turn projections registered')
     } catch (error) {
       // The host allows exactly one definition per event type, and `apply()` can
       // run twice (a reload, or two rows naming the same package). A duplicate is
