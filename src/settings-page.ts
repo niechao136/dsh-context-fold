@@ -199,7 +199,7 @@ function translate(ctx: SettingsPageContext, key: string): string {
 const zh: Record<string, string> = {
   'settings.nav': '上下文折叠',
   'page.title': '上下文折叠',
-  'page.intro': '阶段边界的折叠阈值。改动会写入当前 profile，重启后生效。',
+  'page.intro': '阶段边界的折叠阈值。改动写入当前 profile 后即时生效，无需重启（下一次折叠评估时读取）。',
   'page.save': '保存',
   'page.saving': '保存中…',
   'page.saved': '已保存',
@@ -242,7 +242,7 @@ const zh: Record<string, string> = {
 const en: Record<string, string> = {
   'settings.nav': 'Context fold',
   'page.title': 'Context fold',
-  'page.intro': 'Stage-boundary fold thresholds. Changes are written to the current profile and apply after a restart.',
+  'page.intro': 'Stage-boundary fold thresholds. Saved changes take effect without a restart (read at the next fold evaluation).',
   'page.save': 'Save',
   'page.saving': 'Saving…',
   'page.saved': 'Saved',

@@ -25,6 +25,7 @@ import type { SpillStore } from '@deepseek-ai/dsh-spill'
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import { Config, resolveConfig, type ContextFoldConfig } from './config.ts'
 import { renderReport, reportOf } from './measure.ts'
+import { settingsOpsOf } from './settings-page.ts'
 import type { FoldBatch } from './plan.ts'
 import { gateFoldPool, type FoldGate } from './plan.ts'
 import { planReasoningFolds, reasoningCandidates, reasoningProjection, recordReasoningFolds } from './reasoning.ts'
@@ -82,6 +83,37 @@ export const name = 'context-fold'
 /** The plugin needs a token meter; without a spill store it no-ops with a warning (design §6.5). */
 export const inject = ['tokenMeter']
 
+/**
+ * How often `evaluate` may re-read live settings, in ms.
+ *
+ * The settings page writes through the host's remote settings service, which
+ * does not reload this plugin's fiber, so a saved change only takes effect if
+ * the plugin re-reads it. One host round-trip per minute is enough: fold
+ * thresholds are not latency-sensitive, and the throttle keeps a busy session
+ * from calling `describe()` on every step.
+ */
+const CONFIG_REFRESH_MS = 60_000
+
+/**
+ * Pick this plugin's namespace row out of a settings document.
+ *
+ * The auto-rendered server namespace name is host-defined, so match by content:
+ * the row carrying `keepRecentTurns`. No other plugin's namespace would hold it.
+ *
+ * @param namespaces - rows from `describe()`.
+ * @returns the live value map, or undefined when absent.
+ */
+export function liveConfigOf(
+  namespaces: readonly { value?: Record<string, unknown> }[] | undefined,
+): Record<string, unknown> | undefined {
+  if (namespaces === undefined) return undefined
+  for (const row of namespaces) {
+    const value = row.value
+    if (value !== undefined && 'keepRecentTurns' in value) return value
+  }
+  return undefined
+}
+
 /** Per-session pass guard: one fold pass at a time, and the boundary it last evaluated. */
 interface SessionState {
   /** `${turn}:${step}:${contentGeneration}` of the last evaluation. */
@@ -131,7 +163,11 @@ function declareSettingsPage(ctx: Context): void {
  * @param rawConfig - configuration from the settings row.
  */
 export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}): void {
-  const config = resolveConfig(rawConfig)
+  // Live config: the settings page writes through the host's remote settings
+  // service, which does not reload this plugin's fiber. Re-reading it at each
+  // evaluation is what makes a saved change take effect without a restart.
+  let config = resolveConfig(rawConfig)
+  let configReadAt = 0
 
   // The settings page must exist even when folding is switched off — otherwise
   // turning `enabled` back on would require editing the profile file by hand,
@@ -147,6 +183,31 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
   let warnedMissingSpill = false
   let warnedMissingMeter = false
 
+  /**
+   * Re-read the live settings and rebase `config` on them.
+   *
+   * Throttled: `describe()` is a host round-trip, and a fold decision does not
+   * need it on every step. Failures are swallowed — a stale config is far better
+   * than a fold pass that throws mid-session.
+   *
+   * @param force - bypass the throttle (used once at first evaluation).
+   */
+  async function refreshConfig(force = false): Promise<void> {
+    const now = Date.now()
+    if (!force && now - configReadAt < CONFIG_REFRESH_MS) return
+    configReadAt = now
+    const ops = settingsOpsOf(ctx as never)
+    if (ops === undefined) return
+    try {
+      const described = await ops.describe()
+      if (!described.ok) return
+      const live = liveConfigOf(described.value?.namespaces)
+      if (live !== undefined) config = resolveConfig({ ...rawConfig, ...live })
+    } catch {
+      // Keep the last known-good config.
+    }
+  }
+
   /** Run one idempotent evaluation for an agent at a boundary. */
   async function evaluate(agent: Agent, currentTurn: number, currentStep: number): Promise<FoldPassResult | undefined> {
     const session = agent.session
@@ -161,6 +222,9 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
     state.running = true
     state.boundary = boundary
     try {
+      // Pick up a settings change made since the last evaluation, so the user
+      // does not have to restart the app for a new threshold to apply.
+      await refreshConfig()
       const spillStore = ctx.get('spillStore') as SpillStore | undefined
       if (spillStore === undefined) {
         if (!warnedMissingSpill) {

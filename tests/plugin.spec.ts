@@ -9,7 +9,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { Session, type SessionSeq } from '@deepseek-ai/dsh-session'
 import { SpillLocator, type SaveTextSpill, type SpillRef, type SpillStore } from '@deepseek-ai/dsh-spill'
-import { apply, describeDecision } from '../src/index.ts'
+import { apply, describeDecision, liveConfigOf } from '../src/index.ts'
 import { resolveConfig } from '../src/config.ts'
 import { FOLD_MARKER } from '../src/format.ts'
 import { gateFoldPool } from '../src/plan.ts'
@@ -294,6 +294,26 @@ describe('folded node invariants under the plugin', () => {
     const report = reportOf(session)
     expect(report.folds).toHaveLength(2)
     for (const fold of report.folds) expect(fold.charsAfter).toBeLessThan(fold.charsBefore)
+  })
+})
+
+describe('liveConfigOf', () => {
+  it('finds the namespace carrying this plugin knobs, ignoring others', () => {
+    const live = liveConfigOf([
+      { value: { someOtherPlugin: true } },
+      { value: { keepRecentTurns: 3, minBatchChars: 4000 } },
+    ])
+    expect(live).toEqual({ keepRecentTurns: 3, minBatchChars: 4000 })
+    expect(liveConfigOf([])).toBeUndefined()
+    expect(liveConfigOf(undefined)).toBeUndefined()
+  })
+
+  it('a live value overrides the startup snapshot', () => {
+    // The settings page writes through the host; without re-reading, a saved
+    // change would only apply after a restart.
+    const live = liveConfigOf([{ value: { keepRecentTurns: 2 } }])
+    const merged = resolveConfig({ keepRecentTurns: 5, ...live })
+    expect(merged.keepRecentTurns).toBe(2)
   })
 })
 
