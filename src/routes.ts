@@ -49,6 +49,10 @@ export interface ReportValue {
   folds: FoldRow[]
   counterfactual: ReturnType<typeof counterfactualOf>
   reReads: number
+  /** Tool-call argument folds (scheme B). */
+  argFolds: readonly { seq: number; blocks: number; charsBefore: number }[]
+  /** Archived turns. */
+  turnArchives: readonly { turn: number; messages: number; locator?: string }[]
 }
 
 /** What a route handler receives. */
@@ -170,6 +174,8 @@ export function buildReport(session: Session, deps: RouteDeps): ReportValue {
     folds,
     counterfactual: counterfactualOf(savings, steps, { foldSteps }),
     reReads: tool.reReads,
+    argFolds: tool.argFolds,
+    turnArchives: tool.turnArchives,
   }
 }
 

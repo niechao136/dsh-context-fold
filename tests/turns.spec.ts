@@ -207,3 +207,30 @@ describe('turnProjection', () => {
     expect((projected.content[0] as { text: string }).text).toBe(TURN_ARCHIVED)
   })
 })
+
+describe('panel reporting of new fold kinds', () => {
+  it('reports argument folds and turn archives separately', async () => {
+    const { reportOf, renderReport } = await import('../src/measure.ts')
+    const session = Session.create('report-turns' as never, undefined, undefined, undefined, [turnProjection as never])
+    session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
+    const mk = (id: string, path: string, body: string) => createAssistantMessage({
+      content: [
+        { type: 'text', text: `writing ${path}` },
+        { type: 'tool-call', id: id as never, name: 'write', arguments: JSON.stringify({ file_path: path, content: body }) },
+      ],
+      source: { provider: 'test', model: 'test' },
+    })
+    session.append('assistant/message', { turn: 1, step: 1, message: mk('w1', 'C:\\repo\\a.ts', 'x'.repeat(600)), stream: [] }, { surfaceOp: 'append' })
+    session.append('assistant/message', { turn: 1, step: 2, message: mk('w2', 'C:\\repo\\a.ts', 'y'.repeat(600)), stream: [] }, { surfaceOp: 'append' })
+    const config = resolveConfig({ keepRecentTurns: 5, minFoldArgsChars: 400 })
+    const plans = { args: planArgFolds(session, config), turns: planTurnArchives(session, 10, config) }
+    await recordTurnFolds(session, plans, undefined, config)
+
+    const report = reportOf(session)
+    expect(report.argFolds.length).toBeGreaterThan(0)
+    expect(report.turnArchives.length).toBeGreaterThan(0)
+    const text = renderReport(report, false)
+    expect(text).toContain('Tool arguments folded')
+    expect(text).toContain('Turns archived')
+  })
+})

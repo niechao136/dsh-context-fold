@@ -57,6 +57,15 @@ const deps = (): RouteDeps => ({
 })
 
 describe('buildReport', () => {
+  it('carries argument folds and turn archives in the payload', () => {
+    const session = sessionWithFolds()
+    const report = buildReport(session, deps())
+    // Present (possibly empty) so the client can render the rows without a
+    // field guard; a missing key would read as "feature absent" in the panel.
+    expect(Array.isArray(report.argFolds)).toBe(true)
+    expect(Array.isArray(report.turnArchives)).toBe(true)
+  })
+
   it('reports reasoning folds with their recovery path', async () => {
     const session = sessionWithFolds()
     await recordReasoningFolds(

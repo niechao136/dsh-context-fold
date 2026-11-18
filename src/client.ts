@@ -89,6 +89,10 @@ export interface FoldReportPayload {
   }
   /** Re-read signals observed after each fold. */
   reReads: number
+  /** Tool-call argument folds (scheme B). */
+  argFolds?: readonly { seq: number; blocks: number; charsBefore: number }[]
+  /** Archived turns. */
+  turnArchives?: readonly { turn: number; messages: number; locator?: string }[]
 }
 
 /**
@@ -357,6 +361,28 @@ function Summary(props: { report: FoldReportPayload; t: Translator }): unknown {
         n: String(props.report.folds.length),
       }),
     ),
+    (props.report.argFolds?.length ?? 0) > 0
+      ? el(
+          'div',
+          { className: 'cf-aside', style: { marginTop: '4px' }, key: 'args' },
+          t('summary.argFolds', {
+            n: String(props.report.argFolds?.length ?? 0),
+            blocks: num((props.report.argFolds ?? []).reduce((total, fold) => total + fold.blocks, 0)),
+            chars: num((props.report.argFolds ?? []).reduce((total, fold) => total + fold.charsBefore, 0)),
+          }),
+        )
+      : null,
+    (props.report.turnArchives?.length ?? 0) > 0
+      ? el(
+          'div',
+          { className: 'cf-aside', style: { marginTop: '4px' }, key: 'turns' },
+          t('summary.turnArchives', {
+            n: String(props.report.turnArchives?.length ?? 0),
+            turns: (props.report.turnArchives ?? []).map((archive) => `T${String(archive.turn)}`).join(', '),
+            messages: num((props.report.turnArchives ?? []).reduce((total, archive) => total + archive.messages, 0)),
+          }),
+        )
+      : null,
     props.report.reReads > 0
       ? el(
           'div',

@@ -15,6 +15,7 @@ import { FOLD_MARKER, isFoldedText } from './format.ts'
 import { REASONING_EVENT } from './reasoning.ts'
 import { codePointLength } from './rules.ts'
 import { currentNode } from './session.ts'
+import { TURN_EVENT } from './turns.ts'
 
 /** One fold found in the log. */
 export interface FoldRecord {
@@ -48,6 +49,30 @@ export interface FoldReport {
   rereadNodes: number
   /** Reasoning folds recorded by decision events (phase 2). */
   reasoningFolds: readonly ReasoningFoldRecord[]
+  /** Tool-call argument folds (scheme B), from turn records. */
+  argFolds: readonly ArgFoldRecord[]
+  /** Archived turns, from turn records. */
+  turnArchives: readonly TurnArchiveRecord[]
+}
+
+/** One tool-call argument fold found in the log. */
+export interface ArgFoldRecord {
+  /** Assistant message surface seq holding the folded arguments. */
+  seq: number
+  /** How many argument blocks were folded in that message. */
+  blocks: number
+  /** Original characters of those arguments. */
+  charsBefore: number
+}
+
+/** One archived turn found in the log. */
+export interface TurnArchiveRecord {
+  /** Turn number. */
+  turn: number
+  /** Tool calls / results / reasoning blocks the archive covered. */
+  messages: number
+  /** Spill path of the per-turn archive, when one was written. */
+  locator?: string
 }
 
 /** One reasoning fold found in the log. */
@@ -96,6 +121,57 @@ export function reportOf(session: Session): FoldReport {
     reReads: folds.reduce((total, fold) => total + fold.reReads, 0),
     rereadNodes: folds.filter((fold) => fold.reReads > 0).length,
     reasoningFolds: reasoningFoldsOf(session, events),
+    ...turnFoldsOf(session, events),
+  }
+}
+
+/**
+ * Derive argument folds and turn archives from their durable decision records.
+ *
+ * Argument folds are keyed by message seq so two records covering different
+ * blocks of one message collapse into a single row. Turn archives are keyed by
+ * turn number, keeping the newest locator when one turn is archived twice.
+ *
+ * @param session - session to inspect (unused beyond the signature contract).
+ * @param events - the session's event log.
+ * @returns the two collections, always present.
+ */
+function turnFoldsOf(
+  session: Session,
+  events: readonly SessionEvent[],
+): { argFolds: ArgFoldRecord[]; turnArchives: TurnArchiveRecord[] } {
+  void session
+  const argBySeq = new Map<number, ArgFoldRecord>()
+  const turnByNumber = new Map<number, TurnArchiveRecord>()
+  for (const event of events) {
+    if ((event.type as string) !== TURN_EVENT) continue
+    const data = event.data as {
+      args?: readonly { seq: number; indexes?: readonly number[]; chars?: readonly number[] }[]
+      turns?: readonly { turn: number; seqs?: readonly number[]; locator?: string }[]
+    }
+    for (const target of data.args ?? []) {
+      const blocks = target.indexes?.length ?? 0
+      if (blocks === 0) continue
+      const chars = (target.chars ?? []).reduce((total, value) => total + value, 0)
+      const existing = argBySeq.get(target.seq)
+      if (existing === undefined) {
+        argBySeq.set(target.seq, { seq: target.seq, blocks, charsBefore: chars })
+      } else {
+        existing.blocks += blocks
+        existing.charsBefore += chars
+      }
+    }
+    for (const target of data.turns ?? []) {
+      const messages = target.seqs?.length ?? 0
+      const existing = turnByNumber.get(target.turn)
+      // Keep the newest non-empty locator; a later failed spill must not erase it.
+      const locator = target.locator ?? existing?.locator
+      turnByNumber.set(target.turn, { turn: target.turn, messages, ...(locator === undefined ? {} : { locator }) })
+    }
+  }
+  return {
+    argFolds: [...argBySeq.values()].sort((a, b) => a.seq - b.seq),
+    turnArchives: [...turnByNumber.values()].sort((a, b) => a.turn - b.turn),
   }
 }
 
@@ -232,12 +308,24 @@ export function renderReport(report: FoldReport, dryRun: boolean): string {
     const removed = report.reasoningFolds.reduce((total, fold) => total + Math.max(0, fold.charsBefore - fold.charsAfter), 0)
     lines.push(`Reasoning folded in ${report.reasoningFolds.length} message(s): ${removed.toLocaleString('en-US')} chars removed.`)
   }
-  if (report.folds.length === 0) {
-    if (report.reasoningFolds.length > 0) {
-      if (dryRun) lines.push('dryRun is on: nothing is mutated; candidates are reported by the log line.')
-      return lines.join('\n')
-    }
+  if (report.argFolds.length > 0) {
+    const blocks = report.argFolds.reduce((total, fold) => total + fold.blocks, 0)
+    const removed = report.argFolds.reduce((total, fold) => total + fold.charsBefore, 0)
+    lines.push(`Tool arguments folded: ${blocks} call(s) in ${report.argFolds.length} message(s), ${removed.toLocaleString('en-US')} chars superseded.`)
+  }
+  if (report.turnArchives.length > 0) {
+    const messages = report.turnArchives.reduce((total, archive) => total + archive.messages, 0)
+    const turns = report.turnArchives.map((archive) => `T${archive.turn}`).join(', ')
+    lines.push(`Turns archived: ${report.turnArchives.length} (${turns}), ${messages} message(s) folded to per-turn files.`)
+  }
+  const hasAny = report.folds.length > 0 || report.reasoningFolds.length > 0
+    || report.argFolds.length > 0 || report.turnArchives.length > 0
+  if (!hasAny) {
     lines.push(dryRun ? 'dryRun is on: nothing is mutated; candidates are reported by the log line.' : 'Nothing has been folded in this session yet.')
+    return lines.join('\n')
+  }
+  if (report.folds.length === 0) {
+    if (dryRun) lines.push('dryRun is on: nothing is mutated; candidates are reported by the log line.')
     return lines.join('\n')
   }
   lines.push(`Characters removed: ${report.charsRemoved.toLocaleString('en-US')}`)

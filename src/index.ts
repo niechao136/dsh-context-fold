@@ -246,6 +246,10 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
         ? planReasoningFolds(reasoningCandidates(session), currentTurn, currentStep, config, currentGlobalStep)
         : []
       const argPlans = planArgFolds(session, config)
+      // Only the *count* matters for the gate; the archive itself is written at
+      // the very end, after tool results and reasoning have folded, so its
+      // snapshot records the compact markers (each carrying its own spill path)
+      // instead of duplicating the full originals.
       const turnPlans = planTurnArchives(session, currentTurn, config)
 
       // A turn crossing the archive boundary invalidates the cache regardless:
@@ -266,18 +270,6 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
         // Doing half the work still invalidates the whole prefix.
         return { decision, folded: [], failed: [], charsRemoved: 0 }
       }
-      // Record turn/argument folds (pure projections). Do this before the tool
-      // batches so a single step's invalidation covers all of them at once.
-      if (turnPlans.length > 0 || argPlans.length > 0) {
-        try {
-          const recordSeq = await recordTurnFolds(session, { args: argPlans, turns: turnPlans }, spillStore, config)
-          if (recordSeq !== undefined) {
-            ctx.logger.info(`context-fold: archived ${turnPlans.length} turn(s), folded ${argPlans.length} arg group(s)`)
-          }
-        } catch (error) {
-          ctx.logger.warn(`context-fold: turn archive failed: ${error instanceof Error ? error.message : String(error)}`)
-        }
-      }
       // Reasoning folding is recorded even when no tool batch qualifies: it is a
       // pure projection with no spill write and no surface rewrite, so it has no
       // dependency on the tool-fold decision.
@@ -293,15 +285,14 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
           ctx.logger.warn(`context-fold: reasoning fold failed: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
-      if (decision.batches.length === 0) return { decision, folded: [], failed: [], charsRemoved: 0 }
-      const folded = []
-      const failed = []
       const host = {
         session,
         spillStore,
         config,
         estimateMessage: (message: Parameters<TokenMeter['estimateMessage']>[0]) => tokenMeter.estimateMessage(message),
       }
+      const folded = []
+      const failed = []
       for (const batch of decision.batches as readonly FoldBatch[]) {
         const result = await foldBatch(host, batch)
         folded.push(...result.folded)
@@ -310,6 +301,24 @@ export function apply(ctx: Context, rawConfig: Partial<ContextFoldConfig> = {}):
       const charsRemoved = folded.reduce((total, fold) => total + (fold.charsBefore - fold.charsAfter), 0)
       if (folded.length > 0 || failed.length > 0) {
         ctx.logger.info(`context-fold: folded ${folded.length} node(s), removed ${charsRemoved} chars, ${failed.length} failure(s)`)
+      }
+
+      // Turn archive and argument folding run LAST, after tool results and
+      // reasoning have folded. Two reasons:
+      //   1. The per-turn snapshot then records the compact markers (each with a
+      //      spill path to the original) rather than duplicating full text, so
+      //      an archived turn's detail is one hop away, not two.
+      //   2. The panel counts tool-result folds from this pass separately, so
+      //      archived turn traffic is never double-counted.
+      if (turnPlans.length > 0 || argPlans.length > 0) {
+        try {
+          const recordSeq = await recordTurnFolds(session, { args: argPlans, turns: turnPlans }, spillStore, config)
+          if (recordSeq !== undefined) {
+            ctx.logger.info(`context-fold: archived ${turnPlans.length} turn(s), folded ${argPlans.length} arg group(s)`)
+          }
+        } catch (error) {
+          ctx.logger.warn(`context-fold: turn archive failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
       }
       return { decision, folded, failed, charsRemoved }
     } catch (error) {
