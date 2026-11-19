@@ -251,6 +251,16 @@ const CSS = `
   color: var(--dsw-alias-brand-primary, #8aa2ff);
 }
 
+.cf-tag-arg-fold {
+  background: color-mix(in srgb, var(--dsw-alias-success, #4ade80) 18%, transparent);
+  color: var(--dsw-alias-success, #4ade80);
+}
+
+.cf-tag-turn-archive {
+  background: color-mix(in srgb, var(--dsw-alias-warning, #fbbf24) 18%, transparent);
+  color: var(--dsw-alias-warning, #fbbf24);
+}
+
 .cf-fold-pos {
   flex: none;
   font-size: 11px;

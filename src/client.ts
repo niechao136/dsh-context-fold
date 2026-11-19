@@ -44,8 +44,8 @@ import {
 export interface FoldRow {
   /** Surface seq. */
   seq: number
-  /** `tool-result` or `reasoning`. */
-  kind: 'tool-result' | 'reasoning'
+  /** Fold category. */
+  kind: 'tool-result' | 'reasoning' | 'arg-fold' | 'turn-archive'
   /** Turn it belonged to. */
   turn: number
   /** Step it belonged to. */
@@ -419,7 +419,10 @@ function FoldItem(props: { sessionId: string; fold: FoldRow; t: Translator }): u
   }
 
   const isReasoning = fold.kind === 'reasoning'
-  const tagClass = isReasoning ? 'cf-tag cf-tag-reasoning' : 'cf-tag'
+  const tagClass = fold.kind === 'reasoning' ? 'cf-tag cf-tag-reasoning'
+    : fold.kind === 'arg-fold' ? 'cf-tag cf-tag-arg-fold'
+    : fold.kind === 'turn-archive' ? 'cf-tag cf-tag-turn-archive'
+    : 'cf-tag'
   const saved = fold.tokensBefore - fold.tokensAfter
 
   const body: unknown[] = [
@@ -506,7 +509,9 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload; t: Tran
   })
 
   const reasoningCount = ordered.filter((fold) => fold.kind === 'reasoning').length
-  const toolCount = ordered.length - reasoningCount
+  const argCount = ordered.filter((fold) => fold.kind === 'arg-fold').length
+  const archiveCount = ordered.filter((fold) => fold.kind === 'turn-archive').length
+  const toolCount = ordered.filter((fold) => fold.kind === 'tool-result').length
 
   const controls = el(
     'div',
@@ -525,6 +530,8 @@ function FoldList(props: { sessionId: string; report: FoldReportPayload; t: Tran
         ['all', t('list.filter.all', { n: String(ordered.length) })],
         ['tool-result', t('list.filter.tool', { n: String(toolCount) })],
         ['reasoning', t('list.filter.reasoning', { n: String(reasoningCount) })],
+        ['arg-fold', t('list.filter.argFold', { n: String(argCount) })],
+        ['turn-archive', t('list.filter.turnArchive', { n: String(archiveCount) })],
       ].map(([value, label]) =>
         el(
           'button',

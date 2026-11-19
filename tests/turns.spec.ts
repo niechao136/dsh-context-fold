@@ -8,7 +8,6 @@ import { Session } from '@deepseek-ai/dsh-session'
 import { resolveConfig, type ContextFoldConfig } from '../src/config.ts'
 import {
   ARG_MARKER,
-  TURN_ARCHIVED,
   writeTargetPath,
   planArgFolds,
   isArchivedTurn,
@@ -139,8 +138,7 @@ describe('projectTurnMessage', () => {
       source: { provider: 'test', model: 'test' },
     })
     const out = projectTurnMessage(msg, [], [], true, undefined)
-    expect(out.content).toHaveLength(1)
-    expect((out.content[0] as { text: string }).text).toBe(TURN_ARCHIVED)
+    expect(out.content).toHaveLength(0)
   })
 
   it('appends the recall pointer once, to a text-bearing message', () => {
@@ -203,8 +201,7 @@ describe('turnProjection', () => {
     const config = resolveConfig({ keepRecentTurns: 5 })
     await recordTurnFolds(session, { args: [], turns: planTurnArchives(session, 10, config) }, undefined, config)
     const projected = session.deriveMessages().find((m) => m.role === 'assistant')!
-    expect(projected.content).toHaveLength(1)
-    expect((projected.content[0] as { text: string }).text).toBe(TURN_ARCHIVED)
+    expect(projected.content).toHaveLength(0)
   })
 })
 
@@ -232,5 +229,26 @@ describe('panel reporting of new fold kinds', () => {
     const text = renderReport(report, false)
     expect(text).toContain('Tool arguments folded')
     expect(text).toContain('Turns archived')
+  })
+})
+
+
+describe('archived-turn dedup', () => {
+  it('does not re-archive a turn that is already recorded', async () => {
+    const session = Session.create('dedup-test' as never)
+    // Build enough turns so turn 1 is archiveable at currentTurn 10
+    for (let t = 1; t <= 6; t++) {
+      const u = createUserMessage({ content: text(`q${t}`), source: { kind: 'user' } })
+      session.append('user/message', u, { surfaceOp: 'append' })
+      const a = createAssistantMessage({ content: text(`a${t}`), source: { provider: 'test', model: 'test' } })
+      session.append('assistant/message', { turn: t, step: 2, message: a, stream: [] }, { surfaceOp: 'append' })
+    }
+    const config = resolveConfig({ keepRecentTurns: 3 })
+    const first = planTurnArchives(session, 10, config)
+    expect(first.length).toBeGreaterThan(0)
+    await recordTurnFolds(session, { args: [], turns: first }, undefined, config)
+    // Second planning must skip already-archived turns
+    const second = planTurnArchives(session, 10, config)
+    expect(second).toHaveLength(0)
   })
 })

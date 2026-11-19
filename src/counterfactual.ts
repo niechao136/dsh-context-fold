@@ -80,7 +80,7 @@ export interface FoldedSaving {
   /** Surface seq. */
   seq: number
   /** Kind of fold. */
-  kind: 'tool-result' | 'reasoning'
+  kind: 'tool-result' | 'reasoning' | 'arg-fold' | 'turn-archive'
   /** Character count before folding. */
   charsBefore: number
   /** Character count after folding. */

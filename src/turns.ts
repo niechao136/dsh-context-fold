@@ -38,7 +38,14 @@ export const TURN_EVENT = 'plugin:context-fold/turn' as const
 /** Marker prefix for a folded tool-call argument. */
 export const ARG_MARKER = '[fold:args]'
 
-/** Marker text for an assistant message whose content was entirely archived. */
+/**
+ * An archived assistant message is projected to an empty content array, never
+ * to a human-readable placeholder. A placeholder such as `[turn archived]`
+ * sits in the assistant's own voice; the model can mistake it for a valid way
+ * to answer and emit it verbatim (observed in a 44-turn session, where the
+ * model replied exactly `[turn archived]` and the turn ended). Empty content
+ * carries no text for the model to imitate.
+ */
 export const TURN_ARCHIVED = '[turn archived]'
 
 /** Marker prefix for an archived turn's recall pointer. */
@@ -185,6 +192,24 @@ export function isArchivedTurn(turn: number, currentTurn: number, config: Contex
 }
 
 /**
+ * Turn numbers already covered by an archive record.
+ *
+ * @param events - the session event log.
+ * @returns the set of archived turn numbers.
+ */
+function archivedTurnsOf(events: readonly SessionEvent[]): Set<number> {
+  const turns = new Set<number>()
+  for (const event of events) {
+    if ((event.type as string) !== TURN_EVENT) continue
+    const data = event.data as { turns?: readonly { turn?: unknown }[] }
+    for (const target of data.turns ?? []) {
+      if (typeof target?.turn === 'number') turns.add(target.turn)
+    }
+  }
+  return turns
+}
+
+/**
  * Plan turn archives.
  *
  * A turn is archived when `turn < currentTurn - keepRecentTurns + 1` — with the
@@ -198,10 +223,16 @@ export function isArchivedTurn(turn: number, currentTurn: number, config: Contex
  * @returns turn archive plans, one per archived turn.
  */
 export function planTurnArchives(session: Session, currentTurn: number, config: ContextFoldConfig): TurnPlan[] {
+  const events = session.snapshotEvents()
+  // A turn already archived by an earlier evaluation must never be archived
+  // again: re-planning it would rewrite the same spill file on every later
+  // step, which is both wasted IO and an ever-growing file pile.
+  const alreadyArchived = archivedTurnsOf(events)
   const byTurn = new Map<number, SessionEvent[]>()
-  for (const event of session.snapshotEvents()) {
+  for (const event of events) {
     const data = event.data as { turn?: unknown }
     if (typeof data.turn !== 'number') continue
+    if (alreadyArchived.has(data.turn)) continue
     if (!isArchivedTurn(data.turn, currentTurn, config)) continue
     const list = byTurn.get(data.turn) ?? []
     list.push(event)
@@ -278,7 +309,10 @@ export async function recordTurnFolds(
             callId: `turn-${String(plan.turn)}` as never,
             label: `turn ${String(plan.turn)}`,
           },
-          suggestedName: `${config.turnArchiveDir}/turn-${String(plan.turn).padStart(2, '0')}.md`,
+          // The spill store derives its own file name and URL-encodes any path
+          // separator, so a nested name would materialise as one flat file with
+          // `~002F` in it. Ask for a flat name instead.
+          suggestedName: `turn-${String(plan.turn).padStart(2, '0')}.md`,
           content: plan.content,
         })
         locator = saved.locator
@@ -347,10 +381,12 @@ export function projectTurnMessage(
     }
   }
 
-  // A message with no text left after archiving is an empty shell: collapse it.
+  // A message with no text left after archiving is an empty shell. Project it
+  // to empty content: a text placeholder would be in the assistant's voice and
+  // the model can imitate it as a reply. Empty content leaves nothing to copy.
   const remainingText = blocks.some((block) => block.type === 'text' && block.text.trim() !== '')
   if (archive && !remainingText) {
-    return { ...message, content: [{ type: 'text', text: TURN_ARCHIVED }] }
+    return { ...message, content: [] }
   }
 
   // Append the recall pointer once, to the last text block of the turn.

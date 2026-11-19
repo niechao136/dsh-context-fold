@@ -31,7 +31,7 @@ export interface RouteReply {
 /** One fold row as the tab consumes it. */
 export interface FoldRow {
   seq: number
-  kind: 'tool-result' | 'reasoning'
+  kind: 'tool-result' | 'reasoning' | 'arg-fold' | 'turn-archive'
   turn: number
   step: number
   toolName?: string
@@ -157,6 +157,46 @@ export function buildReport(session: Session, deps: RouteDeps): ReportValue {
         })
       }
     }
+  }
+
+  // Argument folds (scheme B): superseded write/edit arguments on an assistant
+  // message. The original bytes were replaced by a short marker; the marker is
+  // the inline text and the folded arguments are not recoverable from spill
+  // (the current file holds the newer version).
+  for (const record of tool.argFolds) {
+    const source = session.eventAt(record.seq as never)
+    const inline = `[fold:args] ${record.blocks} call(s) folded`
+    folds.push({
+      seq: record.seq,
+      kind: 'arg-fold',
+      turn: source?.type === 'assistant/message' ? source.data.turn : 0,
+      step: source?.type === 'assistant/message' ? source.data.step : 0,
+      charsBefore: record.charsBefore,
+      charsAfter: Array.from(inline).length,
+      tokensBefore: estimateFromChars(record.charsBefore),
+      tokensAfter: estimateFromChars(Array.from(inline).length),
+      inline,
+      recoverable: false,
+    })
+  }
+
+  // Turn archives: a whole old turn folded into one per-turn spill file. The
+  // archive file is retrievable, so these rows point at its locator.
+  for (const record of tool.turnArchives) {
+    const inline = `[fold:turn] turn ${record.turn}: ${record.messages} message(s) archived`
+    folds.push({
+      seq: 0,
+      kind: 'turn-archive',
+      turn: record.turn,
+      step: 0,
+      charsBefore: record.messages * 400,
+      charsAfter: Array.from(inline).length,
+      tokensBefore: estimateFromChars(record.messages * 400),
+      tokensAfter: estimateFromChars(Array.from(inline).length),
+      inline,
+      recoverable: record.locator !== undefined,
+      ...(record.locator === undefined ? {} : { locator: record.locator }),
+    })
   }
 
   const savings: FoldedSaving[] = folds.map((fold) => ({
